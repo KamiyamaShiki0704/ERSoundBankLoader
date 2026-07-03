@@ -54,10 +54,6 @@ For dynamic load/unload mode, set `conditional_enabled=true` and add one mapping
 condition_bank_mapping=<sp_atkcategory>:<chr-sound-bank-id>
 ```
 
-`bank_file_dir=auto` searches for `sd` and `mod/sd` near the DLL, near the game exe, and under nearby project folders. You can still add explicit folders with repeated `bank_file_dir=...` lines.
-
 The old comma-separated keys are still accepted for compatibility.
-
-`SOUND_BANK_LOADER_SKIP_CHR_IDS` in `EnemySummon.lua` only controls whether the old hidden carrier summon is skipped; it does not load or unload banks.
 
 FD4 filecap requests alone were not enough to make sounds play. The confirmed working step is `LoadBankMemoryCopy`.
