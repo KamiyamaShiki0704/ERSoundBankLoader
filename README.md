@@ -17,35 +17,42 @@ This version does not expose an HKS/Lua `act(...)` command. Runtime state is con
 
 ## Config
 
-Place `ersoundbank_loader.ini` beside the DLL. Defaults currently target the banks used by `EnemySummon.lua`:
+Place `ersoundbank_loader.ini` beside the DLL. A minimal config looks like this:
 
 ```ini
 [general]
 enabled=true
 log_enabled=true
 
-[bank_files]
-memory_copy_enabled=true
-bank_file_dir=auto
-
 [runtime]
-conditional_enabled=true
+start_delay_ms=5000
+conditional_enabled=false
 condition_hand=auto
 poll_every_frames=6
 unload_when_inactive=true
 
-[conditional_bank_mappings]
-condition_bank_mapping=73:7800
-condition_bank_mapping=105:8019
-condition_bank_mapping=122:4205
-condition_bank_mapping=132:9495
-condition_bank_mapping=133:9495
-condition_bank_mapping=643:9496
+[bank_files]
+memory_copy_enabled=true
+bank_file_dir=auto
 ```
 
 Set `log_enabled=false` to disable `ersoundbank_loader.log` output.
 
-When `conditional_enabled=true`, `condition_bank_mapping` entries control which bank is loaded for each detected `sp_atkcategory`. `sound_bank_id` entries are only a fallback startup preload list for `conditional_enabled=false`.
+With the minimal config, the DLL loads but does not preload any custom Sound Banks until you add entries.
+
+For startup preload mode, keep `conditional_enabled=false` and add one bank per line:
+
+```ini
+[fallback_startup_preload]
+sound_bank_id=<chr-sound-bank-id>
+```
+
+For dynamic load/unload mode, set `conditional_enabled=true` and add one mapping per line:
+
+```ini
+[conditional_bank_mappings]
+condition_bank_mapping=<sp_atkcategory>:<chr-sound-bank-id>
+```
 
 `bank_file_dir=auto` searches for `sd` and `mod/sd` near the DLL, near the game exe, and under nearby project folders. You can still add explicit folders with repeated `bank_file_dir=...` lines.
 

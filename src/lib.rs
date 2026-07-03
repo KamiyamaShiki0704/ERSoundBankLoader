@@ -55,7 +55,7 @@ impl Default for Config {
         Self {
             enabled: true,
             log_enabled: true,
-            sound_bank_ids: vec![4205, 7800, 8019, 9495, 9496],
+            sound_bank_ids: Vec::new(),
             start_delay_ms: 5000,
             retries_per_id: 120,
             retry_every_frames: 60,
@@ -66,34 +66,9 @@ impl Default for Config {
             ],
             memory_copy_enabled: true,
             bank_file_dirs: vec![PathBuf::from("auto")],
-            conditional_enabled: true,
+            conditional_enabled: false,
             condition_hand: HandMode::Auto,
-            condition_bank_mappings: vec![
-                ConditionBankMapping {
-                    condition_id: 73,
-                    bank_id: 7800,
-                },
-                ConditionBankMapping {
-                    condition_id: 105,
-                    bank_id: 8019,
-                },
-                ConditionBankMapping {
-                    condition_id: 122,
-                    bank_id: 4205,
-                },
-                ConditionBankMapping {
-                    condition_id: 132,
-                    bank_id: 9495,
-                },
-                ConditionBankMapping {
-                    condition_id: 133,
-                    bank_id: 9495,
-                },
-                ConditionBankMapping {
-                    condition_id: 643,
-                    bank_id: 9496,
-                },
-            ],
+            condition_bank_mappings: Vec::new(),
             poll_every_frames: 6,
             unload_when_inactive: true,
         }
