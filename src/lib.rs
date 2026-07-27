@@ -104,8 +104,15 @@ enum ActiveHand {
 #[derive(Default)]
 struct ConditionalState {
     frame: u32,
-    last_condition_id: Option<i32>,
+    last_player_count: Option<usize>,
+    last_condition_ids: HashSet<i32>,
     loaded_banks: HashMap<u32, u32>,
+}
+
+#[derive(Default)]
+struct ConditionSnapshot {
+    player_count: usize,
+    condition_ids: HashSet<i32>,
 }
 
 struct LoadBankResult {
@@ -447,7 +454,7 @@ fn start_conditional_scheduler(
 
     append_log(
         &log_path,
-        "conditional sound_bank_loader scheduler installed on FrameBegin",
+        "conditional sound_bank_loader scheduler installed on FrameBegin; scanning all players",
     );
 
     let path_templates = config.path_templates.clone();
@@ -465,16 +472,24 @@ fn start_conditional_scheduler(
                 return;
             }
 
-            let condition_id = detect_sp_atkcategory(hand);
-            if state.last_condition_id != condition_id {
+            let snapshot = detect_sp_atkcategories(hand);
+            if state.last_player_count != Some(snapshot.player_count)
+                || state.last_condition_ids != snapshot.condition_ids
+            {
+                let mut sorted_condition_ids = snapshot.condition_ids.iter().copied().collect::<Vec<_>>();
+                sorted_condition_ids.sort_unstable();
                 append_log(
                     &log_path,
-                    &format!("condition changed sp_atkcategory={condition_id:?}"),
+                    &format!(
+                        "player conditions changed players={} sp_atkcategories={sorted_condition_ids:?}",
+                        snapshot.player_count
+                    ),
                 );
-                state.last_condition_id = condition_id;
+                state.last_player_count = Some(snapshot.player_count);
+                state.last_condition_ids = snapshot.condition_ids.clone();
             }
 
-            let target_banks = target_banks_for_condition(condition_id, &mappings);
+            let target_banks = target_banks_for_conditions(&snapshot.condition_ids, &mappings);
             if unload_when_inactive {
                 unload_inactive_banks(&log_path, &target_banks, &mut state);
             }
@@ -490,17 +505,13 @@ fn start_conditional_scheduler(
     );
 }
 
-fn target_banks_for_condition(
-    condition_id: Option<i32>,
+fn target_banks_for_conditions(
+    condition_ids: &HashSet<i32>,
     mappings: &[ConditionBankMapping],
 ) -> HashSet<u32> {
-    let Some(condition_id) = condition_id else {
-        return HashSet::new();
-    };
-
     mappings
         .iter()
-        .filter(|mapping| mapping.condition_id == condition_id)
+        .filter(|mapping| condition_ids.contains(&mapping.condition_id))
         .map(|mapping| mapping.bank_id)
         .collect()
 }
@@ -724,10 +735,31 @@ unsafe fn unload_bank(base: usize, loaded_bank_id: u32) -> String {
     )
 }
 
-fn detect_sp_atkcategory(hand_mode: HandMode) -> Option<i32> {
-    let world_chr_man = unsafe { WorldChrMan::instance() }.ok()?;
-    let player = world_chr_man.main_player.as_deref()?;
-    let chr_asm = player.chr_asm.as_ref();
+fn detect_sp_atkcategories(hand_mode: HandMode) -> ConditionSnapshot {
+    let mut snapshot = ConditionSnapshot::default();
+    let Ok(world_chr_man) = (unsafe { WorldChrMan::instance() }) else {
+        return snapshot;
+    };
+    let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
+        return snapshot;
+    };
+
+    for player in world_chr_man.player_chr_set.characters() {
+        snapshot.player_count += 1;
+        if let Some(condition_id) = player_sp_atkcategory(player.chr_asm.as_ref(), hand_mode, repo)
+        {
+            snapshot.condition_ids.insert(condition_id);
+        }
+    }
+
+    snapshot
+}
+
+fn player_sp_atkcategory(
+    chr_asm: &ChrAsm,
+    hand_mode: HandMode,
+    repo: &SoloParamRepository,
+) -> Option<i32> {
     let hand = active_hand(hand_mode, chr_asm);
     let slot_index = active_weapon_slot_index(chr_asm, hand)?;
     let param_id = chr_asm.equipment_param_ids.get(slot_index).copied()?;
@@ -735,9 +767,57 @@ fn detect_sp_atkcategory(hand_mode: HandMode) -> Option<i32> {
         return None;
     }
 
-    let repo = unsafe { SoloParamRepository::instance() }.ok()?;
     let weapon = repo.get::<EquipParamWeapon>(((param_id as u32) / 100) * 100)?;
     Some(weapon.sp_atkcategory() as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_banks_are_union_of_all_player_conditions() {
+        let condition_ids = HashSet::from([73, 122]);
+        let mappings = [
+            ConditionBankMapping {
+                condition_id: 73,
+                bank_id: 7800,
+            },
+            ConditionBankMapping {
+                condition_id: 122,
+                bank_id: 4205,
+            },
+            ConditionBankMapping {
+                condition_id: 132,
+                bank_id: 9495,
+            },
+        ];
+
+        assert_eq!(
+            target_banks_for_conditions(&condition_ids, &mappings),
+            HashSet::from([4205, 7800])
+        );
+    }
+
+    #[test]
+    fn shared_bank_is_deduplicated_across_conditions() {
+        let condition_ids = HashSet::from([132, 133]);
+        let mappings = [
+            ConditionBankMapping {
+                condition_id: 132,
+                bank_id: 9495,
+            },
+            ConditionBankMapping {
+                condition_id: 133,
+                bank_id: 9495,
+            },
+        ];
+
+        assert_eq!(
+            target_banks_for_conditions(&condition_ids, &mappings),
+            HashSet::from([9495])
+        );
+    }
 }
 
 fn active_hand(hand_mode: HandMode, chr_asm: &ChrAsm) -> ActiveHand {
