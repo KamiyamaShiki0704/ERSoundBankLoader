@@ -106,7 +106,7 @@ struct ConditionalState {
     frame: u32,
     last_player_count: Option<usize>,
     last_condition_ids: HashSet<i32>,
-    loaded_banks: HashMap<u32, u32>,
+    loaded_banks: HashMap<u32, TrackedBank>,
 }
 
 #[derive(Default)]
@@ -115,8 +115,29 @@ struct ConditionSnapshot {
     condition_ids: HashSet<i32>,
 }
 
-struct LoadBankResult {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BankOwnership {
+    Loader,
+    External,
+}
+
+impl BankOwnership {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Loader => "loader",
+            Self::External => "external",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TrackedBank {
     loaded_bank_id: u32,
+    ownership: BankOwnership,
+}
+
+struct LoadBankResult {
+    tracked_bank: TrackedBank,
     message: String,
 }
 
@@ -541,12 +562,13 @@ fn load_missing_banks(
             .unwrap_or_else(|message| format!("filecap failed: {message}"));
         match unsafe { load_bank_memory_copy_result(base, *bank_id, bank_file_dirs) } {
             Ok(result) => {
-                state.loaded_banks.insert(*bank_id, result.loaded_bank_id);
+                state.loaded_banks.insert(*bank_id, result.tracked_bank);
                 append_log(
                     log_path,
                     &format!(
-                        "conditional loaded bank id={bank_id}; {filecap_message}; {}",
-                        result.message
+                        "conditional loaded bank id={bank_id} ownership={}; {filecap_message}; {}",
+                        result.tracked_bank.ownership.as_str(),
+                        result.message,
                     ),
                 );
             }
@@ -587,14 +609,27 @@ fn unload_inactive_banks(
     let base = exe.0 as usize;
 
     for bank_id in inactive {
-        let Some(loaded_bank_id) = state.loaded_banks.remove(&bank_id) else {
+        let Some(tracked_bank) = state.loaded_banks.remove(&bank_id) else {
             continue;
         };
-        let message = unsafe { unload_bank(base, loaded_bank_id) };
+
+        if tracked_bank.ownership == BankOwnership::External {
+            append_log(
+                log_path,
+                &format!(
+                    "conditional released bank id={bank_id} loaded_bank_id=0x{:08X}; unload skipped ownership=external (bank pre-existed in Wwise)",
+                    tracked_bank.loaded_bank_id
+                ),
+            );
+            continue;
+        }
+
+        let message = unsafe { unload_bank(base, tracked_bank.loaded_bank_id) };
         append_log(
             log_path,
             &format!(
-                "conditional unloaded bank id={bank_id} loaded_bank_id=0x{loaded_bank_id:08X}; {message}"
+                "conditional unloaded bank id={bank_id} loaded_bank_id=0x{:08X} ownership=loader; {message}",
+                tracked_bank.loaded_bank_id
             ),
         );
     }
@@ -713,9 +748,12 @@ unsafe fn load_bank_memory_copy_result(
         loaded_bank_id
     );
 
-    if is_ak_load_ok(result) {
+    if let Some(ownership) = bank_ownership_for_load_result(result) {
         Ok(LoadBankResult {
-            loaded_bank_id,
+            tracked_bank: TrackedBank {
+                loaded_bank_id,
+                ownership,
+            },
             message,
         })
     } else {
@@ -817,6 +855,27 @@ mod tests {
             target_banks_for_conditions(&condition_ids, &mappings),
             HashSet::from([9495])
         );
+    }
+
+    #[test]
+    fn successful_load_is_owned_by_loader() {
+        assert_eq!(
+            bank_ownership_for_load_result(AK_SUCCESS),
+            Some(BankOwnership::Loader)
+        );
+    }
+
+    #[test]
+    fn already_loaded_bank_is_externally_owned() {
+        assert_eq!(
+            bank_ownership_for_load_result(AK_BANK_ALREADY_LOADED),
+            Some(BankOwnership::External)
+        );
+    }
+
+    #[test]
+    fn failed_load_has_no_ownership() {
+        assert_eq!(bank_ownership_for_load_result(2), None);
     }
 }
 
@@ -1041,8 +1100,12 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn is_ak_load_ok(result: i32) -> bool {
-    result == AK_SUCCESS || result == AK_BANK_ALREADY_LOADED
+fn bank_ownership_for_load_result(result: i32) -> Option<BankOwnership> {
+    match result {
+        AK_SUCCESS => Some(BankOwnership::Loader),
+        AK_BANK_ALREADY_LOADED => Some(BankOwnership::External),
+        _ => None,
+    }
 }
 
 fn ak_result_name(result: i32) -> &'static str {
@@ -1060,8 +1123,7 @@ fn ak_result_name(result: i32) -> &'static str {
         66 => "AK_FormatNotReady",
         67 => "AK_WrongBankVersion",
         68 => "AK_FileNotFound",
-        69 => "AK_DeviceNotReady_or_BankAlreadyLoaded",
-        70 => "AK_BankAlreadyLoaded_or_RenderedFX",
+        69 => "AK_BankAlreadyLoaded",
         _ => "unknown",
     }
 }

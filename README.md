@@ -12,6 +12,7 @@ Elden Ring DLL for preloading character Sound Banks without spawning hidden 0-HP
 - Loads the mapped `cs_c####.bnk` file with `AK::SoundEngine::LoadBankMemoryCopy`.
 - Keeps a mapped bank loaded while any local or remote player matches its condition.
 - Unloads previously loaded dynamic banks with `AK::SoundEngine::UnloadBank` when no player matches.
+- Never unloads a bank that was already present in Wwise before the DLL requested it.
 - Logs AKRESULT and the real Wwise bank id to `ersoundbank_loader.log`.
 
 This version does not expose an HKS/Lua `act(...)` command. Runtime state is controlled by DLL-side condition detection.
@@ -59,6 +60,11 @@ Conditional mode scans all player characters on every poll, including remote pla
 Co-op. Joins, leaves, weapon swaps, and hand-style changes are detected dynamically. Sound Bank
 state is local to each game process, so every player who needs to hear these sounds must install the
 DLL and the same `.bnk` files.
+
+The loader tracks bank ownership from the result of `LoadBankMemoryCopy`. `AK_Success` means the DLL
+performed the load and may later unload it. `AK_BankAlreadyLoaded` means the game or another system
+loaded it first; the DLL borrows that bank and skips `UnloadBank` when the weapon condition ends.
+This prevents mapped weapons from unloading a Sound Bank still needed by a map Boss.
 
 The old comma-separated keys are still accepted for compatibility.
 
