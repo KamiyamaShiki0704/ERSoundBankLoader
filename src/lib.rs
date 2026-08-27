@@ -4,7 +4,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eldenring::{
@@ -14,23 +14,20 @@ use eldenring::{
     },
     fd4::FD4TaskData,
 };
-use fromsoftware_shared::{FromStatic, SharedTaskImpExt};
+use fromsoftware_shared::{FromStatic, InstanceError, RecurringTask};
+use pelite::pe64::{Pe, PeView};
 use windows::Win32::{
     Foundation::HMODULE,
     System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleA},
 };
 
-const FILECAP_REQUEST_FN_RVA: usize = 0x001F2420;
-const LOAD_BANK_MEMORY_COPY_FN_RVA: usize = 0x02239630;
-const UNLOAD_BANK_FN_RVA: usize = 0x022404E0;
 const AK_SUCCESS: i32 = 1;
 const AK_BANK_ALREADY_LOADED: i32 = 69;
-
-#[repr(C)]
-#[fromsoftware_shared::singleton("CSFD4MoWwisebankRepository")]
-struct CSFD4MoWwisebankRepository {
-    _opaque: [u8; 0],
-}
+const LOAD_BANK_MEMORY_COPY_EXPORT: &[u8] =
+    b"?LoadBankMemoryCopy@SoundEngine@AK@@YA?AW4AKRESULT@@PEBXKAEAK@Z";
+const UNLOAD_BANK_EXPORT: &[u8] = b"?UnloadBank@SoundEngine@AK@@YA?AW4AKRESULT@@KPEBX@Z";
+const REGISTER_TASK_PATTERN: &[pelite::pattern::Atom] =
+    pelite::pattern!("e8 ? ? ? ? 48 8b 0d ? ? ? ? 4c 8b c7 8b d3 e8 $ { ' }");
 
 #[derive(Clone)]
 struct Config {
@@ -40,7 +37,6 @@ struct Config {
     start_delay_ms: u64,
     retries_per_id: u32,
     retry_every_frames: u32,
-    path_templates: Vec<String>,
     memory_copy_enabled: bool,
     bank_file_dirs: Vec<PathBuf>,
     conditional_enabled: bool,
@@ -59,11 +55,6 @@ impl Default for Config {
             start_delay_ms: 5000,
             retries_per_id: 120,
             retry_every_frames: 60,
-            path_templates: vec![
-                "wwise:/{id}.bnk".to_string(),
-                "wwise:/cs_c{id4}.bnk".to_string(),
-                "wwise_bnd:/cs_c{id4}.bnk".to_string(),
-            ],
             memory_copy_enabled: true,
             bank_file_dirs: vec![PathBuf::from("auto")],
             conditional_enabled: false,
@@ -141,9 +132,82 @@ struct LoadBankResult {
     message: String,
 }
 
-type FilecapRequestFn = unsafe extern "system" fn(*mut c_void, *const u16, usize) -> *mut c_void;
 type LoadBankMemoryCopyFn = unsafe extern "system" fn(*const c_void, u32, *mut u32) -> i32;
 type UnloadBankFn = unsafe extern "system" fn(u32, *const c_void) -> i32;
+type RegisterTaskFn =
+    unsafe extern "C" fn(&CSTaskImp, CSTaskGroupIndex, &RecurringTask<FD4TaskData>);
+
+#[derive(Clone, Copy)]
+struct RuntimeApi {
+    register_task: RegisterTaskFn,
+    register_task_rva: u32,
+    load_bank_memory_copy: LoadBankMemoryCopyFn,
+    load_bank_memory_copy_rva: u32,
+    unload_bank: UnloadBankFn,
+    unload_bank_rva: u32,
+}
+
+impl RuntimeApi {
+    unsafe fn resolve() -> Result<Self, String> {
+        let exe = unsafe { GetModuleHandleA(None) }
+            .map_err(|err| format!("GetModuleHandleA(None) failed: {err:?}"))?;
+        let base = exe.0 as usize;
+        if base == 0 {
+            return Err("eldenring.exe module base is null".to_string());
+        }
+
+        let pe = unsafe { PeView::module(base as *const u8) };
+        let register_task_rva = resolve_register_task_rva(pe)?;
+        let load_bank_memory_copy_rva = resolve_export_rva(pe, LOAD_BANK_MEMORY_COPY_EXPORT)?;
+        let unload_bank_rva = resolve_export_rva(pe, UNLOAD_BANK_EXPORT)?;
+
+        Ok(Self {
+            register_task: unsafe {
+                std::mem::transmute::<usize, RegisterTaskFn>(base + register_task_rva as usize)
+            },
+            register_task_rva,
+            load_bank_memory_copy: unsafe {
+                std::mem::transmute::<usize, LoadBankMemoryCopyFn>(
+                    base + load_bank_memory_copy_rva as usize,
+                )
+            },
+            load_bank_memory_copy_rva,
+            unload_bank: unsafe {
+                std::mem::transmute::<usize, UnloadBankFn>(base + unload_bank_rva as usize)
+            },
+            unload_bank_rva,
+        })
+    }
+}
+
+fn resolve_export_rva<'a, P: Pe<'a>>(pe: P, name: &[u8]) -> Result<u32, String> {
+    pe.exports()
+        .and_then(|exports| exports.by())
+        .and_then(|exports| exports.name(name))
+        .and_then(|export| export.symbol().ok_or(pelite::Error::Null))
+        .map_err(|err| {
+            format!(
+                "required export {} was not found: {err:?}",
+                String::from_utf8_lossy(name)
+            )
+        })
+}
+
+fn resolve_register_task_rva<'a, P: Pe<'a>>(pe: P) -> Result<u32, String> {
+    let mut captures = [0; 2];
+    if !pe
+        .scanner()
+        .finds_code(REGISTER_TASK_PATTERN, &mut captures)
+    {
+        return Err("register_task signature was missing or ambiguous".to_string());
+    }
+
+    let rva = captures[1];
+    if rva == 0 {
+        return Err("register_task signature resolved a null RVA".to_string());
+    }
+    Ok(rva)
+}
 
 /// # Safety
 ///
@@ -165,14 +229,13 @@ pub unsafe extern "C" fn DllMain(hmodule: usize, reason: u32, _reserved: usize) 
         append_log(
             &log_path,
             &format!(
-                "loaded enabled={} log_enabled={} sound_bank_ids={:?} start_delay_ms={} retries_per_id={} retry_every_frames={} path_templates={:?} memory_copy_enabled={} bank_file_dirs={:?} conditional_enabled={} condition_hand={:?} condition_bank_mappings={} poll_every_frames={} unload_when_inactive={}",
+                "loaded enabled={} log_enabled={} sound_bank_ids={:?} start_delay_ms={} retries_per_id={} retry_every_frames={} memory_copy_enabled={} bank_file_dirs={:?} conditional_enabled={} condition_hand={:?} condition_bank_mappings={} poll_every_frames={} unload_when_inactive={}",
                 config.enabled,
                 config.log_enabled,
                 config.sound_bank_ids,
                 config.start_delay_ms,
                 config.retries_per_id,
                 config.retry_every_frames,
-                config.path_templates,
                 config.memory_copy_enabled,
                 config.bank_file_dirs,
                 config.conditional_enabled,
@@ -193,11 +256,6 @@ pub unsafe extern "C" fn DllMain(hmodule: usize, reason: u32, _reserved: usize) 
             return;
         }
 
-        if config.path_templates.is_empty() {
-            append_log(&log_path, "no path_templates configured");
-            return;
-        }
-
         start_loader_after_delay(log_path, config);
     });
 
@@ -208,7 +266,6 @@ impl Config {
     fn load(hmodule: usize) -> Self {
         let mut config = Self::default();
         let mut sound_bank_ids_configured = false;
-        let mut path_templates_configured = false;
         let mut bank_file_dirs_configured = false;
         let mut condition_mappings_configured = false;
 
@@ -272,17 +329,6 @@ impl Config {
                     if let Ok(parsed) = value.parse::<u32>() {
                         config.retry_every_frames = parsed.max(1);
                     }
-                }
-                ("path_templates", value) | ("candidate_paths", value) => {
-                    config.path_templates = parse_string_list(value);
-                    path_templates_configured = true;
-                }
-                ("path_template", value) | ("candidate_path", value) => {
-                    if !path_templates_configured {
-                        config.path_templates.clear();
-                        path_templates_configured = true;
-                    }
-                    config.path_templates.extend(parse_string_list(value));
                 }
                 ("memory_copy_enabled", value)
                 | ("load_bank_memory_copy", value)
@@ -353,13 +399,34 @@ impl Config {
 fn start_loader_after_delay(log_path: Option<PathBuf>, config: Config) {
     std::thread::sleep(Duration::from_millis(config.start_delay_ms));
 
-    let Ok(cs_task) = CSTaskImp::wait_for_instance(Duration::MAX) else {
-        append_log(&log_path, "failed: CSTaskImp instance not found");
-        return;
+    let api = match unsafe { RuntimeApi::resolve() } {
+        Ok(api) => api,
+        Err(message) => {
+            append_log(
+                &log_path,
+                &format!("failed to resolve runtime API: {message}"),
+            );
+            return;
+        }
+    };
+    append_log(
+        &log_path,
+        &format!(
+            "runtime API resolved register_task=eldenring.exe+0x{:X} LoadBankMemoryCopy=eldenring.exe+0x{:X} UnloadBank=eldenring.exe+0x{:X}",
+            api.register_task_rva, api.load_bank_memory_copy_rva, api.unload_bank_rva
+        ),
+    );
+
+    let cs_task = match wait_for_cs_task() {
+        Ok(cs_task) => cs_task,
+        Err(message) => {
+            append_log(&log_path, &format!("failed: {message}"));
+            return;
+        }
     };
 
     if config.conditional_enabled {
-        start_conditional_scheduler(cs_task, log_path, config);
+        start_conditional_scheduler(cs_task, api, log_path, config);
         return;
     }
 
@@ -381,12 +448,14 @@ fn start_loader_after_delay(log_path: Option<PathBuf>, config: Config) {
         .collect::<Vec<_>>();
     let retry_every_frames = config.retry_every_frames;
     let retries_per_id = config.retries_per_id;
-    let path_templates = config.path_templates.clone();
     let memory_copy_enabled = config.memory_copy_enabled;
     let bank_file_dirs = config.bank_file_dirs.clone();
     let mut finished = false;
 
-    cs_task.run_recurring(
+    install_recurring_task(
+        cs_task,
+        api,
+        CSTaskGroupIndex::SoundStep,
         move |_: &FD4TaskData| {
             if finished {
                 return;
@@ -417,12 +486,7 @@ fn start_loader_after_delay(log_path: Option<PathBuf>, config: Config) {
 
                 pending_bank.attempts = pending_bank.attempts.saturating_add(1);
                 match unsafe {
-                    request_sound_bank(
-                        pending_bank.id,
-                        &path_templates,
-                        memory_copy_enabled,
-                        &bank_file_dirs,
-                    )
+                    request_sound_bank(pending_bank.id, memory_copy_enabled, &bank_file_dirs, api)
                 } {
                     Ok(message) => {
                         append_log(
@@ -452,12 +516,12 @@ fn start_loader_after_delay(log_path: Option<PathBuf>, config: Config) {
                 finished = true;
             }
         },
-        CSTaskGroupIndex::SoundStep,
     );
 }
 
 fn start_conditional_scheduler(
     cs_task: &'static CSTaskImp,
+    api: RuntimeApi,
     log_path: Option<PathBuf>,
     config: Config,
 ) {
@@ -478,7 +542,6 @@ fn start_conditional_scheduler(
         "conditional sound_bank_loader scheduler installed on FrameBegin; scanning all players",
     );
 
-    let path_templates = config.path_templates.clone();
     let bank_file_dirs = config.bank_file_dirs.clone();
     let mappings = config.condition_bank_mappings.clone();
     let hand = config.condition_hand;
@@ -486,7 +549,10 @@ fn start_conditional_scheduler(
     let unload_when_inactive = config.unload_when_inactive;
     let mut state = ConditionalState::default();
 
-    cs_task.run_recurring(
+    install_recurring_task(
+        cs_task,
+        api,
+        CSTaskGroupIndex::FrameBegin,
         move |_: &FD4TaskData| {
             state.frame = state.frame.wrapping_add(1);
             if poll_every_frames > 1 && !state.frame.is_multiple_of(poll_every_frames) {
@@ -497,7 +563,8 @@ fn start_conditional_scheduler(
             if state.last_player_count != Some(snapshot.player_count)
                 || state.last_condition_ids != snapshot.condition_ids
             {
-                let mut sorted_condition_ids = snapshot.condition_ids.iter().copied().collect::<Vec<_>>();
+                let mut sorted_condition_ids =
+                    snapshot.condition_ids.iter().copied().collect::<Vec<_>>();
                 sorted_condition_ids.sort_unstable();
                 append_log(
                     &log_path,
@@ -512,18 +579,46 @@ fn start_conditional_scheduler(
 
             let target_banks = target_banks_for_conditions(&snapshot.condition_ids, &mappings);
             if unload_when_inactive {
-                unload_inactive_banks(&log_path, &target_banks, &mut state);
+                unload_inactive_banks(&log_path, &target_banks, &mut state, api);
             }
-            load_missing_banks(
-                &log_path,
-                &target_banks,
-                &path_templates,
-                &bank_file_dirs,
-                &mut state,
-            );
+            load_missing_banks(&log_path, &target_banks, &bank_file_dirs, &mut state, api);
         },
-        CSTaskGroupIndex::FrameBegin,
     );
+}
+
+fn wait_for_cs_task() -> Result<&'static CSTaskImp, String> {
+    let started = Instant::now();
+    let timeout = Duration::from_secs(60);
+
+    loop {
+        let current_error = match unsafe { CSTaskImp::instance() } {
+            Ok(cs_task) => return Ok(cs_task),
+            Err(InstanceError::NotFound(name)) => format!("singleton not found: {name}"),
+            Err(InstanceError::Null(name)) => format!("singleton not initialized: {name}"),
+        };
+
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "CSTaskImp was unavailable after {} seconds ({})",
+                timeout.as_secs(),
+                current_error
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn install_recurring_task<F>(
+    cs_task: &'static CSTaskImp,
+    api: RuntimeApi,
+    group: CSTaskGroupIndex,
+    execute: F,
+) where
+    F: FnMut(&FD4TaskData) + Send + 'static,
+{
+    // The game owns this task for the remainder of the DLL's process lifetime.
+    let task = Box::leak(Box::new(RecurringTask::new(execute)));
+    unsafe { (api.register_task)(cs_task, group, task) };
 }
 
 fn target_banks_for_conditions(
@@ -540,33 +635,22 @@ fn target_banks_for_conditions(
 fn load_missing_banks(
     log_path: &Option<PathBuf>,
     target_banks: &HashSet<u32>,
-    path_templates: &[String],
     bank_file_dirs: &[PathBuf],
     state: &mut ConditionalState,
+    api: RuntimeApi,
 ) {
-    let Ok(exe) = (unsafe { GetModuleHandleA(None) }) else {
-        append_log(
-            log_path,
-            "conditional load failed: GetModuleHandleA(None) failed",
-        );
-        return;
-    };
-    let base = exe.0 as usize;
-
     for bank_id in target_banks {
         if state.loaded_banks.contains_key(bank_id) {
             continue;
         }
 
-        let filecap_message = unsafe { request_sound_bank_filecap(base, *bank_id, path_templates) }
-            .unwrap_or_else(|message| format!("filecap failed: {message}"));
-        match unsafe { load_bank_memory_copy_result(base, *bank_id, bank_file_dirs) } {
+        match unsafe { load_bank_memory_copy_result(api, *bank_id, bank_file_dirs) } {
             Ok(result) => {
                 state.loaded_banks.insert(*bank_id, result.tracked_bank);
                 append_log(
                     log_path,
                     &format!(
-                        "conditional loaded bank id={bank_id} ownership={}; {filecap_message}; {}",
+                        "conditional loaded bank id={bank_id} ownership={}; {}",
                         result.tracked_bank.ownership.as_str(),
                         result.message,
                     ),
@@ -575,9 +659,7 @@ fn load_missing_banks(
             Err(message) => {
                 append_log(
                     log_path,
-                    &format!(
-                        "conditional load failed bank id={bank_id}; {filecap_message}; {message}"
-                    ),
+                    &format!("conditional load failed bank id={bank_id}; {message}"),
                 );
             }
         }
@@ -588,6 +670,7 @@ fn unload_inactive_banks(
     log_path: &Option<PathBuf>,
     target_banks: &HashSet<u32>,
     state: &mut ConditionalState,
+    api: RuntimeApi,
 ) {
     let inactive = state
         .loaded_banks
@@ -598,15 +681,6 @@ fn unload_inactive_banks(
     if inactive.is_empty() {
         return;
     }
-
-    let Ok(exe) = (unsafe { GetModuleHandleA(None) }) else {
-        append_log(
-            log_path,
-            "conditional unload failed: GetModuleHandleA(None) failed",
-        );
-        return;
-    };
-    let base = exe.0 as usize;
 
     for bank_id in inactive {
         let Some(tracked_bank) = state.loaded_banks.remove(&bank_id) else {
@@ -624,7 +698,7 @@ fn unload_inactive_banks(
             continue;
         }
 
-        let message = unsafe { unload_bank(base, tracked_bank.loaded_bank_id) };
+        let message = unsafe { unload_bank(api, tracked_bank.loaded_bank_id) };
         append_log(
             log_path,
             &format!(
@@ -637,74 +711,21 @@ fn unload_inactive_banks(
 
 unsafe fn request_sound_bank(
     id: u32,
-    path_templates: &[String],
     memory_copy_enabled: bool,
     bank_file_dirs: &[PathBuf],
+    api: RuntimeApi,
 ) -> Result<String, String> {
-    let exe = unsafe { GetModuleHandleA(None) }
-        .map_err(|err| format!("GetModuleHandleA(None) failed: {err:?}"))?;
-    let base = exe.0 as usize;
-
-    let filecap_message = unsafe { request_sound_bank_filecap(base, id, path_templates) };
-
     if !memory_copy_enabled {
-        return filecap_message;
+        return Err(
+            "memory_copy_enabled=false is unsupported; FD4 filecap loading was removed".to_string(),
+        );
     }
 
-    let memory_message = unsafe {
-        load_bank_memory_copy_result(base, id, bank_file_dirs).map(|result| result.message)
-    };
-    match (filecap_message, memory_message) {
-        (Ok(filecap), Ok(memory)) => Ok(format!("{filecap}; {memory}")),
-        (Ok(filecap), Err(memory)) => Err(format!("{filecap}; memory_copy failed: {memory}")),
-        (Err(filecap), Ok(memory)) => Ok(format!("filecap failed: {filecap}; {memory}")),
-        (Err(filecap), Err(memory)) => Err(format!(
-            "filecap failed: {filecap}; memory_copy failed: {memory}"
-        )),
-    }
-}
-
-unsafe fn request_sound_bank_filecap(
-    base: usize,
-    id: u32,
-    path_templates: &[String],
-) -> Result<String, String> {
-    let repository = CSFD4MoWwisebankRepository::instance_ptr()
-        .map_err(|err| format!("CSFD4MoWwisebankRepository instance not found: {err}"))?
-        as *mut c_void;
-    if repository.is_null() {
-        return Err("CSFD4MoWwisebankRepository instance is null".to_string());
-    }
-
-    let request_addr = base + FILECAP_REQUEST_FN_RVA;
-    let request: FilecapRequestFn = unsafe { std::mem::transmute(request_addr) };
-    let mut failures = Vec::new();
-
-    for template in path_templates {
-        let path = expand_path_template(template, id);
-        let mut wide_path = path.encode_utf16().collect::<Vec<_>>();
-        wide_path.push(0);
-
-        let filecap = unsafe { request(repository, wide_path.as_ptr(), 0) };
-        if !filecap.is_null() {
-            return Ok(format!(
-                "filecap_request path={path} fn=eldenring.exe+0x{FILECAP_REQUEST_FN_RVA:X} addr=0x{request_addr:X} repository=0x{:X} result=0x{:X}",
-                repository as usize, filecap as usize
-            ));
-        }
-
-        failures.push(format!("{path}=0x0"));
-    }
-
-    Err(format!(
-        "all candidates returned null fn=eldenring.exe+0x{FILECAP_REQUEST_FN_RVA:X} addr=0x{request_addr:X} repository=0x{:X} candidates=[{}]",
-        repository as usize,
-        failures.join(", ")
-    ))
+    unsafe { load_bank_memory_copy_result(api, id, bank_file_dirs) }.map(|result| result.message)
 }
 
 unsafe fn load_bank_memory_copy_result(
-    base: usize,
+    api: RuntimeApi,
     id: u32,
     bank_file_dirs: &[PathBuf],
 ) -> Result<LoadBankResult, String> {
@@ -727,11 +748,9 @@ unsafe fn load_bank_memory_copy_result(
         ));
     }
 
-    let fn_addr = base + LOAD_BANK_MEMORY_COPY_FN_RVA;
-    let load_bank_memory_copy: LoadBankMemoryCopyFn = unsafe { std::mem::transmute(fn_addr) };
     let mut loaded_bank_id = 0u32;
     let result = unsafe {
-        load_bank_memory_copy(
+        (api.load_bank_memory_copy)(
             bytes.as_ptr() as *const c_void,
             bytes.len() as u32,
             &mut loaded_bank_id,
@@ -740,9 +759,10 @@ unsafe fn load_bank_memory_copy_result(
 
     let result_name = ak_result_name(result);
     let message = format!(
-        "memory_copy path={} size={} fn=eldenring.exe+0x{LOAD_BANK_MEMORY_COPY_FN_RVA:X} addr=0x{fn_addr:X} ak_result={}({result_name}) loaded_bank_id={} 0x{:08X}",
+        "memory_copy path={} size={} fn=eldenring.exe+0x{:X} ak_result={}({result_name}) loaded_bank_id={} 0x{:08X}",
         bank_path.display(),
         bytes.len(),
+        api.load_bank_memory_copy_rva,
         result,
         loaded_bank_id,
         loaded_bank_id
@@ -761,15 +781,13 @@ unsafe fn load_bank_memory_copy_result(
     }
 }
 
-unsafe fn unload_bank(base: usize, loaded_bank_id: u32) -> String {
-    let fn_addr = base + UNLOAD_BANK_FN_RVA;
-    let unload_bank: UnloadBankFn = unsafe { std::mem::transmute(fn_addr) };
-    let result = unsafe { unload_bank(loaded_bank_id, std::ptr::null()) };
+unsafe fn unload_bank(api: RuntimeApi, loaded_bank_id: u32) -> String {
+    let result = unsafe { (api.unload_bank)(loaded_bank_id, std::ptr::null()) };
     let result_name = ak_result_name(result);
 
     format!(
-        "unload_bank fn=eldenring.exe+0x{UNLOAD_BANK_FN_RVA:X} addr=0x{fn_addr:X} ak_result={}({result_name})",
-        result
+        "unload_bank fn=eldenring.exe+0x{:X} ak_result={}({result_name})",
+        api.unload_bank_rva, result
     )
 }
 
@@ -810,8 +828,10 @@ fn player_sp_atkcategory(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use pelite::pe64::PeFile;
 
     #[test]
     fn target_banks_are_union_of_all_player_conditions() {
@@ -877,6 +897,55 @@ mod tests {
     fn failed_load_has_no_ownership() {
         assert_eq!(bank_ownership_for_load_result(2), None);
     }
+
+    #[test]
+    fn runtime_symbols_resolve_from_configured_game_executable() {
+        let Some(path) = std::env::var_os("ER_GAME_EXE").map(PathBuf::from) else {
+            eprintln!("ER_GAME_EXE is not set; static game compatibility check skipped");
+            return;
+        };
+
+        let bytes = fs::read(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let pe = PeFile::from_bytes(&bytes)
+            .unwrap_or_else(|err| panic!("failed to parse {}: {err:?}", path.display()));
+        let register_task_rva = resolve_register_task_rva(pe)
+            .unwrap_or_else(|err| panic!("register_task compatibility check failed: {err}"));
+        let load_bank_memory_copy_rva = resolve_export_rva(pe, LOAD_BANK_MEMORY_COPY_EXPORT)
+            .unwrap_or_else(|err| panic!("LoadBankMemoryCopy compatibility check failed: {err}"));
+        let unload_bank_rva = resolve_export_rva(pe, UNLOAD_BANK_EXPORT)
+            .unwrap_or_else(|err| panic!("UnloadBank compatibility check failed: {err}"));
+        let text = pe
+            .section_headers()
+            .by_name(".text")
+            .and_then(|section| pe.get_section_bytes(section).ok())
+            .expect(".text section missing or malformed");
+        let fd4_singleton_candidates = from_singleton::find::fd4_singleton_pat_iter(text).count();
+        assert!(
+            fd4_singleton_candidates > 0,
+            "FD4 singleton reflection signature produced no candidates"
+        );
+        for name in [
+            b"CSTask\0".as_slice(),
+            b"WorldChrMan\0",
+            b"SoloParamRepository\0",
+        ] {
+            assert!(
+                bytes.windows(name.len()).any(|window| window == name),
+                "required DLRF singleton name {} was not found",
+                String::from_utf8_lossy(&name[..name.len() - 1])
+            );
+        }
+
+        assert_ne!(register_task_rva, 0);
+        assert_ne!(load_bank_memory_copy_rva, 0);
+        assert_ne!(unload_bank_rva, 0);
+        assert_ne!(load_bank_memory_copy_rva, unload_bank_rva);
+        println!(
+            "compatible executable={} register_task=0x{register_task_rva:X} LoadBankMemoryCopy=0x{load_bank_memory_copy_rva:X} UnloadBank=0x{unload_bank_rva:X} fd4_singleton_candidates={fd4_singleton_candidates} required_singleton_names=ok",
+            path.display(),
+        );
+    }
 }
 
 fn active_hand(hand_mode: HandMode, chr_asm: &ChrAsm) -> ActiveHand {
@@ -915,12 +984,6 @@ fn find_bank_file(id: u32, bank_file_dirs: &[PathBuf]) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-fn expand_path_template(template: &str, id: u32) -> String {
-    template
-        .replace("{id4}", &format!("{id:04}"))
-        .replace("{id}", &id.to_string())
-}
-
 fn parse_id_list(value: &str) -> Vec<u32> {
     value
         .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
@@ -932,15 +995,6 @@ fn parse_id_list(value: &str) -> Vec<u32> {
                 trimmed.parse::<u32>().ok()
             }
         })
-        .collect()
-}
-
-fn parse_string_list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(ToOwned::to_owned)
         .collect()
 }
 

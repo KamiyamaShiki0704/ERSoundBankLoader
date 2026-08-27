@@ -1,14 +1,18 @@
 [package]
 name = "er-sound-bank-loader"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 publish = false
 
 [dependencies]
-eldenring = { path = "../../_Example/fromsoftware-rs/fromsoftware-rs-0.14.0/crates/eldenring" }
-fromsoftware-shared = { path = "../../_Example/fromsoftware-rs/fromsoftware-rs-0.14.0/crates/shared" }
+eldenring = "0.14.0"
+fromsoftware-shared = "0.14.0"
+pelite = "0.10"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
+[dev-dependencies]
+from-singleton = "3.0"
 
 [lib]
 crate-type = ["cdylib"]

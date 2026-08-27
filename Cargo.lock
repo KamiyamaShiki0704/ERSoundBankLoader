@@ -70,6 +70,8 @@ checksum = "c2ea6706d74fca54e15f1d40b5cf7fe7f764aaec61352a9fcec58fe27e042fc8"
 [[package]]
 name = "eldenring"
 version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f98d635e24da261a5972a2f74cb453140acf31c23216d1b27744e5de0727108"
 dependencies = [
  "bitfield",
  "bitflags",
@@ -101,10 +103,12 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "er-sound-bank-loader"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eldenring",
+ "from-singleton",
  "fromsoftware-shared",
+ "pelite",
  "windows",
 ]
 
@@ -124,6 +128,8 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared"
 version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e2a3db947909eb9fff3637bc882683f0b0dadee9884ea24ceb107525ad19d96"
 dependencies = [
  "bitflags",
  "from-singleton",
@@ -139,6 +145,8 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared-macros"
 version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e83f4050cdfb1847ee0d31385f53dc197bf414b39abc9d92483f571fb9e750b"
 dependencies = [
  "inflections",
  "proc-macro2",
@@ -149,6 +157,8 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared-stl"
 version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfeff057215d7f565737d8ee24516b2a77dff92966626fe42e0f36e9a289f2c5"
 
 [[package]]
 name = "fxhash"

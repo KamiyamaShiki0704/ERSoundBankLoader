@@ -7,7 +7,7 @@ Elden Ring DLL for preloading character Sound Banks without spawning hidden 0-HP
 - Loads as a native `cdylib`.
 - Waits for `CSTask` to exist.
 - Schedules retry attempts on `CSTaskGroupIndex::SoundStep`.
-- Logs FD4 `wwise:/####.bnk` filecap requests for diagnostics.
+- Resolves the task scheduler and Wwise functions at runtime instead of using version-specific RVAs.
 - Reads the active weapon `sp_atkcategory` of every player in `WorldChrMan.player_chr_set`.
 - Loads the mapped `cs_c####.bnk` file with `AK::SoundEngine::LoadBankMemoryCopy`.
 - Keeps a mapped bank loaded while any local or remote player matches its condition.
@@ -16,6 +16,18 @@ Elden Ring DLL for preloading character Sound Banks without spawning hidden 0-HP
 - Logs AKRESULT and the real Wwise bank id to `ersoundbank_loader.log`.
 
 This version does not expose an HKS/Lua `act(...)` command. Runtime state is controlled by DLL-side condition detection.
+
+## Compatibility Check
+
+The compatibility probe verifies the task-registration signature, named Wwise exports, FD4
+singleton-reflection signatures, and required singleton names in an Elden Ring executable:
+
+```powershell
+.\Scripts\delivery\er-2.7-compat\script\Test-ERSoundBankCompatibility.ps1 -GameExe "<path-to-eldenring.exe>"
+```
+
+The current implementation is statically verified against Elden Ring `2.7.0.0` and the retained
+`2.6.2.0` reference executable. Runtime symbol resolution allows both versions to use the same DLL.
 
 ## Config
 
@@ -68,4 +80,7 @@ This prevents mapped weapons from unloading a Sound Bank still needed by a map B
 
 The old comma-separated keys are still accepted for compatibility.
 
-FD4 filecap requests alone were not enough to make sounds play. The confirmed working step is `LoadBankMemoryCopy`.
+FD4 filecap requests alone were not enough to make sounds play, so that obsolete diagnostic path is
+no longer called. The loader resolves the exported `LoadBankMemoryCopy` and `UnloadBank` functions by
+name, while the internal task-registration function is found with a unique runtime signature. This
+avoids tying the DLL to the function RVAs of one Elden Ring executable version.
