@@ -6,8 +6,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
-eldenring = "0.14.0"
-fromsoftware-shared = "0.14.0"
+eldenring = { git = "https://github.com/vswarte/eldenring-rs.git", rev = "902851865d05069eda7dcfd6385c8881eadf29bf" }
+fromsoftware-shared = { git = "https://github.com/vswarte/eldenring-rs.git", rev = "902851865d05069eda7dcfd6385c8881eadf29bf" }
 pelite = "0.10"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
 

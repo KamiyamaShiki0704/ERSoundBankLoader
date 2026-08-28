@@ -29,6 +29,18 @@ singleton-reflection signatures, and required singleton names in an Elden Ring e
 The current implementation is statically verified against Elden Ring `2.7.0.0` and the retained
 `2.6.2.0` reference executable. Runtime symbol resolution allows both versions to use the same DLL.
 
+## Building
+
+Build the Release DLL with:
+
+```powershell
+cargo build --release
+```
+
+No sibling or local `fromsoftware-rs` checkout is required. Cargo fetches `eldenring` and
+`fromsoftware-shared` from `vswarte/eldenring-rs`, with both dependencies pinned to commit
+`902851865d05069eda7dcfd6385c8881eadf29bf` for reproducible source selection.
+
 ## Config
 
 Place `ersoundbank_loader.ini` beside the DLL. A minimal config looks like this:
