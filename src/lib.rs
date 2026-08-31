@@ -42,6 +42,7 @@ struct Config {
     conditional_enabled: bool,
     condition_hand: HandMode,
     condition_bank_mappings: Vec<ConditionBankMapping>,
+    sp_effect_bank_mappings: Vec<ConditionBankMapping>,
     poll_every_frames: u32,
     unload_when_inactive: bool,
 }
@@ -60,6 +61,7 @@ impl Default for Config {
             conditional_enabled: false,
             condition_hand: HandMode::Auto,
             condition_bank_mappings: Vec::new(),
+            sp_effect_bank_mappings: Vec::new(),
             poll_every_frames: 6,
             unload_when_inactive: true,
         }
@@ -96,14 +98,16 @@ enum ActiveHand {
 struct ConditionalState {
     frame: u32,
     last_player_count: Option<usize>,
-    last_condition_ids: HashSet<i32>,
+    last_sp_atkcategories: HashSet<i32>,
+    last_sp_effect_ids: HashSet<i32>,
     loaded_banks: HashMap<u32, TrackedBank>,
 }
 
 #[derive(Default)]
 struct ConditionSnapshot {
     player_count: usize,
-    condition_ids: HashSet<i32>,
+    sp_atkcategories: HashSet<i32>,
+    sp_effect_ids: HashSet<i32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,7 +233,7 @@ pub unsafe extern "C" fn DllMain(hmodule: usize, reason: u32, _reserved: usize) 
         append_log(
             &log_path,
             &format!(
-                "loaded enabled={} log_enabled={} sound_bank_ids={:?} start_delay_ms={} retries_per_id={} retry_every_frames={} memory_copy_enabled={} bank_file_dirs={:?} conditional_enabled={} condition_hand={:?} condition_bank_mappings={} poll_every_frames={} unload_when_inactive={}",
+                "loaded enabled={} log_enabled={} sound_bank_ids={:?} start_delay_ms={} retries_per_id={} retry_every_frames={} memory_copy_enabled={} bank_file_dirs={:?} conditional_enabled={} condition_hand={:?} condition_bank_mappings={} sp_effect_bank_mappings={} poll_every_frames={} unload_when_inactive={}",
                 config.enabled,
                 config.log_enabled,
                 config.sound_bank_ids,
@@ -241,6 +245,7 @@ pub unsafe extern "C" fn DllMain(hmodule: usize, reason: u32, _reserved: usize) 
                 config.conditional_enabled,
                 config.condition_hand,
                 format_condition_bank_mappings(&config.condition_bank_mappings),
+                format_condition_bank_mappings(&config.sp_effect_bank_mappings),
                 config.poll_every_frames,
                 config.unload_when_inactive,
             ),
@@ -268,6 +273,7 @@ impl Config {
         let mut sound_bank_ids_configured = false;
         let mut bank_file_dirs_configured = false;
         let mut condition_mappings_configured = false;
+        let mut sp_effect_mappings_configured = false;
 
         let Some(path) = sidecar_path(hmodule, "ersoundbank_loader.ini") else {
             return config;
@@ -373,6 +379,23 @@ impl Config {
                     }
                     config
                         .condition_bank_mappings
+                        .extend(parse_condition_bank_mappings(value));
+                }
+                ("sp_effect_bank_mappings", value)
+                | ("speffect_bank_mappings", value)
+                | ("sp_effect_mappings", value) => {
+                    config.sp_effect_bank_mappings = parse_condition_bank_mappings(value);
+                    sp_effect_mappings_configured = true;
+                }
+                ("sp_effect_bank_mapping", value)
+                | ("speffect_bank_mapping", value)
+                | ("sp_effect_mapping", value) => {
+                    if !sp_effect_mappings_configured {
+                        config.sp_effect_bank_mappings.clear();
+                        sp_effect_mappings_configured = true;
+                    }
+                    config
+                        .sp_effect_bank_mappings
                         .extend(parse_condition_bank_mappings(value));
                 }
                 ("poll_every_frames", value) => {
@@ -525,8 +548,11 @@ fn start_conditional_scheduler(
     log_path: Option<PathBuf>,
     config: Config,
 ) {
-    if config.condition_bank_mappings.is_empty() {
-        append_log(&log_path, "conditional mode has no condition_bank_mappings");
+    if config.condition_bank_mappings.is_empty() && config.sp_effect_bank_mappings.is_empty() {
+        append_log(
+            &log_path,
+            "conditional mode has no condition_bank_mappings or sp_effect_bank_mappings",
+        );
         return;
     }
     if !config.memory_copy_enabled {
@@ -543,7 +569,12 @@ fn start_conditional_scheduler(
     );
 
     let bank_file_dirs = config.bank_file_dirs.clone();
-    let mappings = config.condition_bank_mappings.clone();
+    let sp_atkcategory_mappings = config.condition_bank_mappings.clone();
+    let sp_effect_mappings = config.sp_effect_bank_mappings.clone();
+    let watched_sp_effect_ids = sp_effect_mappings
+        .iter()
+        .map(|mapping| mapping.condition_id)
+        .collect::<HashSet<_>>();
     let hand = config.condition_hand;
     let poll_every_frames = config.poll_every_frames.max(1);
     let unload_when_inactive = config.unload_when_inactive;
@@ -559,25 +590,38 @@ fn start_conditional_scheduler(
                 return;
             }
 
-            let snapshot = detect_sp_atkcategories(hand);
+            let snapshot = detect_player_conditions(hand, &watched_sp_effect_ids);
             if state.last_player_count != Some(snapshot.player_count)
-                || state.last_condition_ids != snapshot.condition_ids
+                || state.last_sp_atkcategories != snapshot.sp_atkcategories
+                || state.last_sp_effect_ids != snapshot.sp_effect_ids
             {
-                let mut sorted_condition_ids =
-                    snapshot.condition_ids.iter().copied().collect::<Vec<_>>();
-                sorted_condition_ids.sort_unstable();
+                let mut sorted_sp_atkcategories = snapshot
+                    .sp_atkcategories
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                sorted_sp_atkcategories.sort_unstable();
+                let mut sorted_sp_effect_ids =
+                    snapshot.sp_effect_ids.iter().copied().collect::<Vec<_>>();
+                sorted_sp_effect_ids.sort_unstable();
                 append_log(
                     &log_path,
                     &format!(
-                        "player conditions changed players={} sp_atkcategories={sorted_condition_ids:?}",
+                        "player conditions changed players={} sp_atkcategories={sorted_sp_atkcategories:?} sp_effects={sorted_sp_effect_ids:?}",
                         snapshot.player_count
                     ),
                 );
                 state.last_player_count = Some(snapshot.player_count);
-                state.last_condition_ids = snapshot.condition_ids.clone();
+                state.last_sp_atkcategories = snapshot.sp_atkcategories.clone();
+                state.last_sp_effect_ids = snapshot.sp_effect_ids.clone();
             }
 
-            let target_banks = target_banks_for_conditions(&snapshot.condition_ids, &mappings);
+            let target_banks = target_banks_for_conditions(
+                &snapshot.sp_atkcategories,
+                &sp_atkcategory_mappings,
+                &snapshot.sp_effect_ids,
+                &sp_effect_mappings,
+            );
             if unload_when_inactive {
                 unload_inactive_banks(&log_path, &target_banks, &mut state, api);
             }
@@ -622,14 +666,23 @@ fn install_recurring_task<F>(
 }
 
 fn target_banks_for_conditions(
-    condition_ids: &HashSet<i32>,
-    mappings: &[ConditionBankMapping],
+    sp_atkcategories: &HashSet<i32>,
+    sp_atkcategory_mappings: &[ConditionBankMapping],
+    sp_effect_ids: &HashSet<i32>,
+    sp_effect_mappings: &[ConditionBankMapping],
 ) -> HashSet<u32> {
-    mappings
+    let mut target_banks = sp_atkcategory_mappings
         .iter()
-        .filter(|mapping| condition_ids.contains(&mapping.condition_id))
+        .filter(|mapping| sp_atkcategories.contains(&mapping.condition_id))
         .map(|mapping| mapping.bank_id)
-        .collect()
+        .collect::<HashSet<_>>();
+    target_banks.extend(
+        sp_effect_mappings
+            .iter()
+            .filter(|mapping| sp_effect_ids.contains(&mapping.condition_id))
+            .map(|mapping| mapping.bank_id),
+    );
+    target_banks
 }
 
 fn load_missing_banks(
@@ -791,20 +844,29 @@ unsafe fn unload_bank(api: RuntimeApi, loaded_bank_id: u32) -> String {
     )
 }
 
-fn detect_sp_atkcategories(hand_mode: HandMode) -> ConditionSnapshot {
+fn detect_player_conditions(
+    hand_mode: HandMode,
+    watched_sp_effect_ids: &HashSet<i32>,
+) -> ConditionSnapshot {
     let mut snapshot = ConditionSnapshot::default();
     let Ok(world_chr_man) = (unsafe { WorldChrMan::instance() }) else {
         return snapshot;
     };
-    let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
-        return snapshot;
-    };
+    let repo = unsafe { SoloParamRepository::instance() }.ok();
 
     for player in world_chr_man.player_chr_set.characters() {
         snapshot.player_count += 1;
-        if let Some(condition_id) = player_sp_atkcategory(player.chr_asm.as_ref(), hand_mode, repo)
+        if let Some(repo) = repo
+            && let Some(condition_id) =
+                player_sp_atkcategory(player.chr_asm.as_ref(), hand_mode, repo)
         {
-            snapshot.condition_ids.insert(condition_id);
+            snapshot.sp_atkcategories.insert(condition_id);
+        }
+
+        for entry in player.chr_ins.special_effect.entries() {
+            if watched_sp_effect_ids.contains(&entry.param_id) {
+                snapshot.sp_effect_ids.insert(entry.param_id);
+            }
         }
     }
 
@@ -852,7 +914,7 @@ mod tests {
         ];
 
         assert_eq!(
-            target_banks_for_conditions(&condition_ids, &mappings),
+            target_banks_for_conditions(&condition_ids, &mappings, &HashSet::new(), &[],),
             HashSet::from([4205, 7800])
         );
     }
@@ -872,7 +934,55 @@ mod tests {
         ];
 
         assert_eq!(
-            target_banks_for_conditions(&condition_ids, &mappings),
+            target_banks_for_conditions(&condition_ids, &mappings, &HashSet::new(), &[],),
+            HashSet::from([9495])
+        );
+    }
+
+    #[test]
+    fn weapon_and_sp_effect_triggers_form_bank_union() {
+        let sp_atkcategories = HashSet::from([73]);
+        let sp_effect_ids = HashSet::from([100_008]);
+        let sp_atkcategory_mappings = [ConditionBankMapping {
+            condition_id: 73,
+            bank_id: 7800,
+        }];
+        let sp_effect_mappings = [ConditionBankMapping {
+            condition_id: 100_008,
+            bank_id: 4205,
+        }];
+
+        assert_eq!(
+            target_banks_for_conditions(
+                &sp_atkcategories,
+                &sp_atkcategory_mappings,
+                &sp_effect_ids,
+                &sp_effect_mappings,
+            ),
+            HashSet::from([4205, 7800])
+        );
+    }
+
+    #[test]
+    fn shared_bank_is_deduplicated_across_trigger_types() {
+        let sp_atkcategories = HashSet::from([132]);
+        let sp_effect_ids = HashSet::from([100_008]);
+        let sp_atkcategory_mappings = [ConditionBankMapping {
+            condition_id: 132,
+            bank_id: 9495,
+        }];
+        let sp_effect_mappings = [ConditionBankMapping {
+            condition_id: 100_008,
+            bank_id: 9495,
+        }];
+
+        assert_eq!(
+            target_banks_for_conditions(
+                &sp_atkcategories,
+                &sp_atkcategory_mappings,
+                &sp_effect_ids,
+                &sp_effect_mappings,
+            ),
             HashSet::from([9495])
         );
     }

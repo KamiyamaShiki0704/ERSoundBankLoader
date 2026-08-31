@@ -8,9 +8,10 @@ Elden Ring DLL for preloading character Sound Banks without spawning hidden 0-HP
 - Waits for `CSTask` to exist.
 - Schedules retry attempts on `CSTaskGroupIndex::SoundStep`.
 - Resolves the task scheduler and Wwise functions at runtime instead of using version-specific RVAs.
-- Reads the active weapon `sp_atkcategory` of every player in `WorldChrMan.player_chr_set`.
+- Reads the active weapon `sp_atkcategory` and configured active SpEffects of every player in
+  `WorldChrMan.player_chr_set`.
 - Loads the mapped `cs_c####.bnk` file with `AK::SoundEngine::LoadBankMemoryCopy`.
-- Keeps a mapped bank loaded while any local or remote player matches its condition.
+- Keeps a mapped bank loaded while any local or remote player matches either trigger type.
 - Unloads previously loaded dynamic banks with `AK::SoundEngine::UnloadBank` when no player matches.
 - Never unloads a bank that was already present in Wwise before the DLL requested it.
 - Logs AKRESULT and the real Wwise bank id to `ersoundbank_loader.log`.
@@ -73,17 +74,22 @@ For startup preload mode, keep `conditional_enabled=false` and add one bank per 
 sound_bank_id=<chr-sound-bank-id>
 ```
 
-For dynamic load/unload mode, set `conditional_enabled=true` and add one mapping per line:
+For dynamic load/unload mode, set `conditional_enabled=true`. A Bank can be triggered by an active
+weapon `sp_atkcategory`, an active SpEffect, or both:
 
 ```ini
 [conditional_bank_mappings]
 condition_bank_mapping=<sp_atkcategory>:<chr-sound-bank-id>
+sp_effect_bank_mapping=<SpEffect-ID>:<chr-sound-bank-id>
 ```
 
 Conditional mode scans all player characters on every poll, including remote players in Seamless
-Co-op. Joins, leaves, weapon swaps, and hand-style changes are detected dynamically. Sound Bank
-state is local to each game process, so every player who needs to hear these sounds must install the
-DLL and the same `.bnk` files.
+Co-op. Joins, leaves, weapon swaps, hand-style changes, and configured SpEffect changes are detected
+dynamically. Only SpEffect IDs present in `sp_effect_bank_mapping` entries are retained in condition
+snapshots and logs. When multiple trigger entries request the same Bank, it is loaded once and stays
+loaded until every matching weapon and SpEffect trigger has become inactive. Sound Bank state is
+local to each game process, so every player who needs to hear these sounds must install the DLL and
+the same `.bnk` files.
 
 The loader tracks bank ownership from the result of `LoadBankMemoryCopy`. `AK_Success` means the DLL
 performed the load and may later unload it. `AK_BankAlreadyLoaded` means the game or another system
