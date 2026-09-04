@@ -14,6 +14,10 @@ Elden Ring DLL for preloading character Sound Banks without spawning hidden 0-HP
 - Keeps a mapped bank loaded while any local or remote player matches either trigger type.
 - Unloads previously loaded dynamic banks with `AK::SoundEngine::UnloadBank` when no player matches.
 - Never unloads a bank that was already present in Wwise before the DLL requested it.
+- Conditionally requests native `SfxBnd_c####.ffxbnd` SFX Banks by weapon `sp_atkcategory` or
+  active SpEffect, with demand deduplicated across all players and both trigger types.
+- Releases only its own SFX Bank reference after the last matching condition ends; native resource
+  management decides when the bundle can be physically collected.
 - Logs AKRESULT and the real Wwise bank id to `ersoundbank_loader.log`.
 
 This version does not expose an HKS/Lua `act(...)` command. Runtime state is controlled by DLL-side condition detection.
@@ -61,6 +65,10 @@ unload_when_inactive=true
 [bank_files]
 memory_copy_enabled=true
 bank_file_dir=auto
+
+[conditional_sfx_bank_mappings]
+sfx_enabled=false
+sfx_ready_timeout_ms=10000
 ```
 
 Set `log_enabled=false` to disable `ersoundbank_loader.log` output.
@@ -97,6 +105,39 @@ loaded it first; the DLL borrows that bank and skips `UnloadBank` when the weapo
 This prevents mapped weapons from unloading a Sound Bank still needed by a map Boss.
 
 The old comma-separated keys are still accepted for compatibility.
+
+SFX Bank loading is configured independently of Sound Bank loading. It does not use
+`conditional_enabled`, `memory_copy_enabled`, `unload_when_inactive`, or `bank_file_dir`.
+Enable it and add one mapping per line:
+
+```ini
+[conditional_sfx_bank_mappings]
+sfx_enabled=true
+sfx_ready_timeout_ms=10000
+sfx_condition_bank_mapping=<sp_atkcategory>:<SFX-Resource-Bank-ID>
+sfx_sp_effect_bank_mapping=<SpEffect-ID>:<SFX-Resource-Bank-ID>
+```
+
+Both trigger types scan every player in `WorldChrMan.player_chr_set`. If multiple players or
+conditions request the same SFX Bank, the DLL acquires one native reference. It releases that
+reference only after no configured trigger requests the Bank. Loading a Bank does not spawn or
+play an effect; it makes the bundle resources available for actions that request them.
+
+The SFX Resource Bank ID maps to the game's virtual path
+`sfxbnd:/SfxBnd_c####.ffxbnd`. The corresponding `sfxbnd_c####.ffxbnd.dcx` must be available through
+the active game or mod VFS. Do not point `bank_file_dir` at SFX files; that option is only for loose
+Wwise `.bnk` files.
+
+`sfx_ready_timeout_ms` accepts 1000 through 120000 milliseconds. A timeout is diagnostic: the DLL
+does not repeatedly request or forcibly cancel the bundle while the condition remains active.
+The log distinguishes condition demand, native request, resource-ready observation, release, and
+fail-closed shutdown. Resource-ready does not prove visual output; actions and effects still need
+in-game validation.
+
+Native SFX support is currently guarded for the inspected Elden Ring 2.7.0.0 executable. If the
+executable identity, native code, manager identity, or retained resource ownership does not match,
+the SFX subsystem disables itself without disabling the existing Sound Bank path. Native task
+concurrency and all map-transition cases are not fully proven, so test new mappings offline first.
 
 FD4 filecap requests alone were not enough to make sounds play, so that obsolete diagnostic path is
 no longer called. The loader resolves the exported `LoadBankMemoryCopy` and `UnloadBank` functions by

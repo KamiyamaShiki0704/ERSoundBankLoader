@@ -21,6 +21,8 @@ use windows::Win32::{
     System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleA},
 };
 
+mod sfx;
+
 const AK_SUCCESS: i32 = 1;
 const AK_BANK_ALREADY_LOADED: i32 = 69;
 const LOAD_BANK_MEMORY_COPY_EXPORT: &[u8] =
@@ -31,6 +33,7 @@ const REGISTER_TASK_PATTERN: &[pelite::pattern::Atom] =
 
 #[derive(Clone)]
 struct Config {
+    sfx: sfx::Settings,
     enabled: bool,
     log_enabled: bool,
     sound_bank_ids: Vec<u32>,
@@ -50,6 +53,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            sfx: sfx::Settings::default(),
             enabled: true,
             log_enabled: true,
             sound_bank_ids: Vec::new(),
@@ -233,7 +237,7 @@ pub unsafe extern "C" fn DllMain(hmodule: usize, reason: u32, _reserved: usize) 
         append_log(
             &log_path,
             &format!(
-                "loaded enabled={} log_enabled={} sound_bank_ids={:?} start_delay_ms={} retries_per_id={} retry_every_frames={} memory_copy_enabled={} bank_file_dirs={:?} conditional_enabled={} condition_hand={:?} condition_bank_mappings={} sp_effect_bank_mappings={} poll_every_frames={} unload_when_inactive={}",
+                "loaded enabled={} log_enabled={} sound_bank_ids={:?} start_delay_ms={} retries_per_id={} retry_every_frames={} memory_copy_enabled={} bank_file_dirs={:?} conditional_enabled={} condition_hand={:?} condition_bank_mappings={} sp_effect_bank_mappings={} poll_every_frames={} unload_when_inactive={} sfx={}",
                 config.enabled,
                 config.log_enabled,
                 config.sound_bank_ids,
@@ -248,6 +252,7 @@ pub unsafe extern "C" fn DllMain(hmodule: usize, reason: u32, _reserved: usize) 
                 format_condition_bank_mappings(&config.sp_effect_bank_mappings),
                 config.poll_every_frames,
                 config.unload_when_inactive,
+                config.sfx.summary(),
             ),
         );
 
@@ -256,7 +261,7 @@ pub unsafe extern "C" fn DllMain(hmodule: usize, reason: u32, _reserved: usize) 
             return;
         }
 
-        if !config.conditional_enabled && config.sound_bank_ids.is_empty() {
+        if !config.conditional_enabled && config.sound_bank_ids.is_empty() && !config.sfx.enabled {
             append_log(&log_path, "no sound_bank_ids configured");
             return;
         }
@@ -408,7 +413,7 @@ impl Config {
                         config.unload_when_inactive = parsed;
                     }
                 }
-                _ => {}
+                (key, value) => config.sfx.parse_entry(key, value),
             }
         }
 
@@ -448,8 +453,16 @@ fn start_loader_after_delay(log_path: Option<PathBuf>, config: Config) {
         }
     };
 
+    if config.sfx.enabled {
+        sfx::start(cs_task, api, log_path.clone(), &config);
+    }
+
     if config.conditional_enabled {
         start_conditional_scheduler(cs_task, api, log_path, config);
+        return;
+    }
+
+    if config.sound_bank_ids.is_empty() {
         return;
     }
 
