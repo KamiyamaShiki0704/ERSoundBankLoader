@@ -365,6 +365,19 @@ mod tests {
     }
 
     #[test]
+    fn supported_profiles_keep_independent_addresses_and_reject_unknown_identity() {
+        let old = select_profile(0x69e9c9b9, 0x5e09600).unwrap();
+        let new = select_profile(0x6a96b418, 0x5e0da00).unwrap();
+        assert_eq!(old.code[0].1, 0xd90cf0);
+        assert_eq!(new.code[0].1, 0xd90d60);
+        assert_eq!(old.code[1].1, 0xd91020);
+        assert_eq!(new.code[1].1, 0xd91090);
+        assert_eq!(old.code[2].1, new.code[2].1);
+        assert!(select_profile(0x6a96b418, 0x5e09600).is_err());
+        assert!(select_profile(0, 0).is_err());
+    }
+
+    #[test]
     fn configured_game_image_matches_and_tampering_is_rejected() {
         let Some(path) = std::env::var_os("ER_GAME_EXE") else {
             eprintln!("SKIPPED SFX executable probe: set ER_GAME_EXE to run");
@@ -372,15 +385,25 @@ mod tests {
         };
         let mut bytes = std::fs::read(path).expect("read configured executable");
         let pe = PeFile::from_bytes(&bytes).expect("PE64");
-        validate_image(pe).expect("SFX native code matches inspected executable");
-        let offset = pe.rva_to_file_offset(CODE[0].1).unwrap();
-        bytes[offset] ^= 1;
-        assert!(
-            validate_image(PeFile::from_bytes(&bytes).unwrap())
-                .unwrap_err()
-                .contains("fingerprint mismatch")
+        let profile = validate_image(pe).expect("SFX native code matches inspected executable");
+        for &(name, rva, _, _) in profile.code {
+            let offset = PeFile::from_bytes(&bytes)
+                .unwrap()
+                .rva_to_file_offset(rva)
+                .unwrap();
+            bytes[offset] ^= 1;
+            assert!(
+                validate_image(PeFile::from_bytes(&bytes).unwrap())
+                    .unwrap_err()
+                    .contains("fingerprint mismatch"),
+                "{name}"
+            );
+            bytes[offset] ^= 1;
+        }
+        println!(
+            "SFX {} fingerprints PASS; modified acquire function rejected",
+            profile.version
         );
-        println!("SFX 2.7.0.0 fingerprints PASS; modified acquire function rejected");
     }
 }
 
@@ -412,7 +435,8 @@ pub(super) fn start(
     append_log(
         &log,
         &format!(
-            "sfx enabled for ER 2.7.0.0: weapon_mappings={} sp_effect_mappings={} ready_timeout_ms={}; FrameBegin demand -> FileStepUpdate_Begin resources; concurrency remains experimental",
+            "sfx enabled for ER {}: weapon_mappings={} sp_effect_mappings={} ready_timeout_ms={}; FrameBegin demand -> FileStepUpdate_Begin resources; concurrency remains experimental",
+            backend.profile.version,
             config.sfx.weapon_mappings.len(),
             config.sfx.sp_effect_mappings.len(),
             config.sfx.ready_timeout_ms,
@@ -481,7 +505,7 @@ pub(super) fn start(
 }
 
 // Code fingerprints guard this experimental ABI against accidental version/patch changes.
-const CODE: &[(&str, u32, usize, u64)] = &[
+const CODE_270: &[(&str, u32, usize, u64)] = &[
     ("path_acquire", 0xd90cf0, 0x208, 0x5b1fc0ea256532f0),
     ("release_cap", 0xd91020, 0x56, 0x2bb6d543d5b79bbd),
     ("ffxbnd_factory", 0x1f1d10, 0x123, 0x8d63c5610997e392),
@@ -492,20 +516,61 @@ const CODE: &[(&str, u32, usize, u64)] = &[
     ("decrement_use", 0x20f320, 0x1e, 0x0092f536dab1d5f3),
 ];
 
+const CODE_271: &[(&str, u32, usize, u64)] = &[
+    ("path_acquire", 0xd90d60, 0x208, 0xca1c34d3b16b4032),
+    ("release_cap", 0xd91090, 0x56, 0x771e160290158dfe),
+    ("ffxbnd_factory", 0x1f1d10, 0x123, 0x208b866c9be4c972),
+    ("collector", 0xd93230, 0x298, 0x8d3372a36f113b7e),
+    ("csfile_release", 0x26541e0, 0x94, 0x6402dc4629687677),
+    ("reference_release", 0x2654280, 0x76, 0x9dbe686227bb6ef3),
+    ("increment_use", 0x20f2b0, 0x7, 0xe3741b79a0cd5043),
+    ("decrement_use", 0x20f320, 0x1e, 0x0092f536dab1d5f3),
+];
+
+#[derive(Debug)]
+struct Profile {
+    version: &'static str,
+    timestamp: u32,
+    image_size: u32,
+    code: &'static [(&'static str, u32, usize, u64)],
+}
+
+const PROFILES: &[Profile] = &[
+    Profile {
+        version: "2.7.0.0",
+        timestamp: 0x69e9c9b9,
+        image_size: 0x5e09600,
+        code: CODE_270,
+    },
+    Profile {
+        version: "2.7.1.0",
+        timestamp: 0x6a96b418,
+        image_size: 0x5e0da00,
+        code: CODE_271,
+    },
+];
+
+fn select_profile(timestamp: u32, image_size: u32) -> Result<&'static Profile, String> {
+    PROFILES
+        .iter()
+        .find(|p| p.timestamp == timestamp && p.image_size == image_size)
+        .ok_or_else(|| {
+            "unsupported executable identity; SFX requires inspected ER 2.7.0.0 or 2.7.1.0".into()
+        })
+}
+
 fn fingerprint(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
     })
 }
 
-fn validate_image<'a>(pe: impl Pe<'a>) -> Result<(), String> {
-    if pe.file_header().TimeDateStamp != 0x69e9c9b9 || pe.optional_header().SizeOfImage != 0x5e09600
-    {
-        return Err(
-            "unsupported executable identity; SFX prototype requires inspected ER 2.7.0.0".into(),
-        );
-    }
-    for &(name, rva, size, expected) in CODE {
+fn validate_image<'a>(pe: impl Pe<'a>) -> Result<&'static Profile, String> {
+    let profile = select_profile(
+        pe.file_header().TimeDateStamp,
+        pe.optional_header().SizeOfImage,
+    )?;
+    for &(name, rva, size, expected) in profile.code {
         let bytes = pe
             .derva_slice::<u8>(rva, size)
             .map_err(|e| format!("{name}: {e:?}"))?;
@@ -515,7 +580,7 @@ fn validate_image<'a>(pe: impl Pe<'a>) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(profile)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -552,6 +617,7 @@ type Release = unsafe extern "system" fn(usize, usize);
 
 struct Native {
     base: usize,
+    profile: &'static Profile,
     context: Option<Context>,
     acquire: Acquire,
     release: Release,
@@ -563,12 +629,17 @@ impl Native {
             .map_err(|e| format!("module: {e:?}"))?
             .0 as usize;
         let pe = unsafe { PeView::module(base as *const u8) };
-        validate_image(pe)?;
+        let profile = validate_image(pe)?;
         Ok(Self {
             base,
+            profile,
             context: None,
-            acquire: unsafe { std::mem::transmute::<usize, Acquire>(base + 0xd90cf0) },
-            release: unsafe { std::mem::transmute::<usize, Release>(base + 0xd91020) },
+            acquire: unsafe {
+                std::mem::transmute::<usize, Acquire>(base + profile.code[0].1 as usize)
+            },
+            release: unsafe {
+                std::mem::transmute::<usize, Release>(base + profile.code[1].1 as usize)
+            },
         })
     }
 

@@ -31,8 +31,9 @@ singleton-reflection signatures, and required singleton names in an Elden Ring e
 .\Scripts\delivery\er-2.7-compat\script\Test-ERSoundBankCompatibility.ps1 -GameExe "<path-to-eldenring.exe>"
 ```
 
-The current implementation is statically verified against Elden Ring `2.7.0.0` and the retained
-`2.6.2.0` reference executable. Runtime symbol resolution allows both versions to use the same DLL.
+The Sound Bank implementation is statically verified against Elden Ring `2.7.1.0`, `2.7.0.0` and the retained
+`2.6.2.0` reference executable. Runtime symbol resolution supports these versions in the same DLL.
+SFX compatibility is checked separately; see the [1.17.1 compatibility report](Scripts/delivery/sfx-bank-recon/compatibility-1.17.1.md).
 
 ## Building
 
@@ -134,7 +135,9 @@ The log distinguishes condition demand, native request, resource-ready observati
 fail-closed shutdown. Resource-ready does not prove visual output; actions and effects still need
 in-game validation.
 
-Native SFX support is currently guarded for the inspected Elden Ring 2.7.0.0 executable. If the
+Native SFX support has separate guarded profiles for internal executable versions `2.7.0.0` and
+`2.7.1.0` (game patch 1.17.1). The latter moves native acquire/release functions while leaving
+some resource helpers unchanged. Both profiles validate code fingerprints before use. If the
 executable identity, native code, manager identity, or retained resource ownership does not match,
 the SFX subsystem disables itself without disabling the existing Sound Bank path. Native task
 concurrency and all map-transition cases are not fully proven, so test new mappings offline first.
