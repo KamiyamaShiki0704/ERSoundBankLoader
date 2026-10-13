@@ -1,5 +1,4 @@
 use std::{
-    collections::{HashMap, HashSet},
     ffi::c_void,
     fs::{self, OpenOptions},
     io::Write,
@@ -7,30 +6,36 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eldenring::{
-    cs::{
-        CSTaskGroupIndex, CSTaskImp, ChrAsm, ChrAsmArmStyle, EquipParamWeapon, SoloParamRepository,
-        WorldChrMan,
-    },
-    fd4::FD4TaskData,
+use shikifsrs_elden_ring::{
+    TaskPhase, Ww171File,
+    character_equipment::WeaponSelectionMode,
+    current_sound_conditions::SoundConditionReadConfig,
+    sound_bank_resident::{ResidentSoundBankConfig, ResidentSoundBankSlot},
+    sound_bank_schedule::{BankAssetSource, SoundBankScheduleConfig},
+    sound_conditions::ConditionBankMapping as SdkMapping,
 };
-use fromsoftware_shared::{FromStatic, InstanceError, RecurringTask};
-use pelite::pe64::{Pe, PeView};
+use shikifsrs_runtime::memory::CurrentProcess;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use windows::Win32::{
     Foundation::HMODULE,
     System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleA},
 };
+use windows::core::BOOL;
+
+#[cfg(test)]
+use std::collections::HashSet;
 
 mod sfx;
 
+static SOUND: ResidentSoundBankSlot = ResidentSoundBankSlot::new();
+static STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
 const AK_SUCCESS: i32 = 1;
+#[cfg(test)]
 const AK_BANK_ALREADY_LOADED: i32 = 69;
-const LOAD_BANK_MEMORY_COPY_EXPORT: &[u8] =
-    b"?LoadBankMemoryCopy@SoundEngine@AK@@YA?AW4AKRESULT@@PEBXKAEAK@Z";
-const UNLOAD_BANK_EXPORT: &[u8] = b"?UnloadBank@SoundEngine@AK@@YA?AW4AKRESULT@@KPEBX@Z";
-const REGISTER_TASK_PATTERN: &[pelite::pattern::Atom] =
-    pelite::pattern!("e8 ? ? ? ? 48 8b 0d ? ? ? ? 4c 8b c7 8b d3 e8 $ { ' }");
-
 #[derive(Clone)]
 struct Config {
     sfx: sfx::Settings,
@@ -72,13 +77,6 @@ impl Default for Config {
     }
 }
 
-#[derive(Clone)]
-struct PendingBank {
-    id: u32,
-    attempts: u32,
-    done: bool,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct ConditionBankMapping {
     condition_id: i32,
@@ -92,139 +90,25 @@ enum HandMode {
     Left,
 }
 
-#[derive(Clone, Copy)]
-enum ActiveHand {
-    Left,
-    Right,
-}
-
-#[derive(Default)]
-struct ConditionalState {
-    frame: u32,
-    last_player_count: Option<usize>,
-    last_sp_atkcategories: HashSet<i32>,
-    last_sp_effect_ids: HashSet<i32>,
-    loaded_banks: HashMap<u32, TrackedBank>,
-}
-
-#[derive(Default)]
-struct ConditionSnapshot {
-    player_count: usize,
-    sp_atkcategories: HashSet<i32>,
-    sp_effect_ids: HashSet<i32>,
-}
-
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BankOwnership {
     Loader,
     External,
 }
-
-impl BankOwnership {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Loader => "loader",
-            Self::External => "external",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct TrackedBank {
-    loaded_bank_id: u32,
-    ownership: BankOwnership,
-}
-
-struct LoadBankResult {
-    tracked_bank: TrackedBank,
-    message: String,
-}
-
-type LoadBankMemoryCopyFn = unsafe extern "system" fn(*const c_void, u32, *mut u32) -> i32;
-type UnloadBankFn = unsafe extern "system" fn(u32, *const c_void) -> i32;
-type RegisterTaskFn =
-    unsafe extern "C" fn(&CSTaskImp, CSTaskGroupIndex, &RecurringTask<FD4TaskData>);
-
-#[derive(Clone, Copy)]
-struct RuntimeApi {
-    register_task: RegisterTaskFn,
-    register_task_rva: u32,
-    load_bank_memory_copy: LoadBankMemoryCopyFn,
-    load_bank_memory_copy_rva: u32,
-    unload_bank: UnloadBankFn,
-    unload_bank_rva: u32,
-}
-
-impl RuntimeApi {
-    unsafe fn resolve() -> Result<Self, String> {
-        let exe = unsafe { GetModuleHandleA(None) }
-            .map_err(|err| format!("GetModuleHandleA(None) failed: {err:?}"))?;
-        let base = exe.0 as usize;
-        if base == 0 {
-            return Err("eldenring.exe module base is null".to_string());
-        }
-
-        let pe = unsafe { PeView::module(base as *const u8) };
-        let register_task_rva = resolve_register_task_rva(pe)?;
-        let load_bank_memory_copy_rva = resolve_export_rva(pe, LOAD_BANK_MEMORY_COPY_EXPORT)?;
-        let unload_bank_rva = resolve_export_rva(pe, UNLOAD_BANK_EXPORT)?;
-
-        Ok(Self {
-            register_task: unsafe {
-                std::mem::transmute::<usize, RegisterTaskFn>(base + register_task_rva as usize)
-            },
-            register_task_rva,
-            load_bank_memory_copy: unsafe {
-                std::mem::transmute::<usize, LoadBankMemoryCopyFn>(
-                    base + load_bank_memory_copy_rva as usize,
-                )
-            },
-            load_bank_memory_copy_rva,
-            unload_bank: unsafe {
-                std::mem::transmute::<usize, UnloadBankFn>(base + unload_bank_rva as usize)
-            },
-            unload_bank_rva,
-        })
-    }
-}
-
-fn resolve_export_rva<'a, P: Pe<'a>>(pe: P, name: &[u8]) -> Result<u32, String> {
-    pe.exports()
-        .and_then(|exports| exports.by())
-        .and_then(|exports| exports.name(name))
-        .and_then(|export| export.symbol().ok_or(pelite::Error::Null))
-        .map_err(|err| {
-            format!(
-                "required export {} was not found: {err:?}",
-                String::from_utf8_lossy(name)
-            )
-        })
-}
-
-fn resolve_register_task_rva<'a, P: Pe<'a>>(pe: P) -> Result<u32, String> {
-    let mut captures = [0; 2];
-    if !pe
-        .scanner()
-        .finds_code(REGISTER_TASK_PATTERN, &mut captures)
-    {
-        return Err("register_task signature was missing or ambiguous".to_string());
-    }
-
-    let rva = captures[1];
-    if rva == 0 {
-        return Err("register_task signature resolved a null RVA".to_string());
-    }
-    Ok(rva)
-}
-
 /// # Safety
 ///
 /// This is the Windows DLL entry point. It is called by the loader.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn DllMain(hmodule: usize, reason: u32, _reserved: usize) -> bool {
-    if reason != 1 {
-        return true;
+pub unsafe extern "system" fn DllMain(
+    hmodule: HMODULE,
+    reason: u32,
+    _reserved: *mut c_void,
+) -> BOOL {
+    if reason != 1 || STARTED.swap(true, Ordering::AcqRel) {
+        return BOOL(1);
     }
+    let hmodule = hmodule.0 as usize;
 
     std::thread::spawn(move || {
         let config = Config::load(hmodule);
@@ -269,7 +153,7 @@ pub unsafe extern "C" fn DllMain(hmodule: usize, reason: u32, _reserved: usize) 
         start_loader_after_delay(log_path, config);
     });
 
-    true
+    BOOL(1)
 }
 
 impl Config {
@@ -424,260 +308,216 @@ impl Config {
     }
 }
 
-fn start_loader_after_delay(log_path: Option<PathBuf>, config: Config) {
-    std::thread::sleep(Duration::from_millis(config.start_delay_ms));
-
-    let api = match unsafe { RuntimeApi::resolve() } {
-        Ok(api) => api,
-        Err(message) => {
+fn selection(hand: HandMode) -> WeaponSelectionMode {
+    match hand {
+        HandMode::Left => WeaponSelectionMode::Even,
+        HandMode::Right => WeaponSelectionMode::Odd,
+        HandMode::Auto => WeaponSelectionMode::AutoTwoHand,
+    }
+}
+fn condition_config(
+    hand: HandMode,
+    weapon: &[ConditionBankMapping],
+    effects: &[ConditionBankMapping],
+) -> SoundConditionReadConfig {
+    let convert = |values: &[ConditionBankMapping]| {
+        values
+            .iter()
+            .map(|v| SdkMapping {
+                condition_id: v.condition_id,
+                bank_id: v.bank_id,
+            })
+            .collect()
+    };
+    SoundConditionReadConfig {
+        selection: selection(hand),
+        weapon_mappings: convert(weapon),
+        effect_mappings: convert(effects),
+        ..Default::default()
+    }
+}
+impl Config {
+    fn schedule(&self) -> SoundBankScheduleConfig {
+        SoundBankScheduleConfig {
+            enabled: self.enabled,
+            static_ids: if self.conditional_enabled {
+                Vec::new()
+            } else {
+                self.sound_bank_ids.clone()
+            },
+            start_delay_ms: 0,
+            attempts_per_id: self.retries_per_id,
+            retry_every_frames: self.retry_every_frames,
+            memory_copy_enabled: self.memory_copy_enabled,
+            conditional_enabled: self.conditional_enabled,
+            poll_every_frames: self.poll_every_frames,
+            unload_when_inactive: self.unload_when_inactive,
+        }
+    }
+}
+struct Files {
+    dirs: Vec<PathBuf>,
+    log: Option<PathBuf>,
+}
+impl BankAssetSource for Files {
+    fn read_bank(&mut self, id: u32) -> shikifsrs_runtime::Result<Vec<u8>> {
+        let path = find_bank_file(id, &self.dirs).ok_or(
+            shikifsrs_runtime::Error::NativeOperationRejected("bank file not found"),
+        )?;
+        let bytes = fs::read(&path).map_err(|error| {
             append_log(
-                &log_path,
-                &format!("failed to resolve runtime API: {message}"),
+                &self.log,
+                &format!("bank id={id} read {} failed: {error}", path.display()),
             );
-            return;
-        }
-    };
-    append_log(
-        &log_path,
-        &format!(
-            "runtime API resolved register_task=eldenring.exe+0x{:X} LoadBankMemoryCopy=eldenring.exe+0x{:X} UnloadBank=eldenring.exe+0x{:X}",
-            api.register_task_rva, api.load_bank_memory_copy_rva, api.unload_bank_rva
-        ),
-    );
-
-    let cs_task = match wait_for_cs_task() {
-        Ok(cs_task) => cs_task,
-        Err(message) => {
-            append_log(&log_path, &format!("failed: {message}"));
-            return;
-        }
-    };
-
+            shikifsrs_runtime::Error::NativeOperationRejected("bank file read failed")
+        })?;
+        append_log(
+            &self.log,
+            &format!(
+                "bank id={id} source={} bytes={}",
+                path.display(),
+                bytes.len()
+            ),
+        );
+        Ok(bytes)
+    }
+}
+fn start_loader_after_delay(log: Option<PathBuf>, config: Config) {
+    if let Err(error) = unsafe { install_current(&log, &config) } {
+        append_log(
+            &log,
+            &format!("SDK sound installation failed: {error}; no automatic retry"),
+        );
+    }
+}
+/// # Safety
+/// Loader retains this DLL until PIN. Caller supplies serialized registration/allocator and
+/// complete initialized sound/resource graph, correct callback phases and coherent observations.
+/// Initial epoch1 and original native SFX backend are experimental; no teardown/reuse may race.
+unsafe fn install_current(log: &Option<PathBuf>, config: &Config) -> Result<(), String> {
+    let bytes: Arc<[u8]> = fs::read(std::env::current_exe().map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?
+        .into();
+    let file = Ww171File::verify(&bytes).map_err(|e| e.to_string())?;
+    std::thread::sleep(Duration::from_millis(config.start_delay_ms));
+    let base = unsafe { GetModuleHandleA(None) }
+        .map_err(|e| e.to_string())?
+        .0 as u64;
+    let mut phases = vec![TaskPhase::SOUND_STEP, TaskPhase::FRAME_BEGIN];
     if config.sfx.enabled {
-        sfx::start(cs_task, api, log_path.clone(), &config);
-    }
-
-    if config.conditional_enabled {
-        start_conditional_scheduler(cs_task, api, log_path, config);
-        return;
-    }
-
-    if config.sound_bank_ids.is_empty() {
-        return;
-    }
-
-    append_log(
-        &log_path,
-        "startup preload scheduler installed on SoundStep",
-    );
-
-    let mut frame = 0u32;
-    let mut pending = config
-        .sound_bank_ids
-        .iter()
-        .copied()
-        .map(|id| PendingBank {
-            id,
-            attempts: 0,
-            done: false,
-        })
-        .collect::<Vec<_>>();
-    let retry_every_frames = config.retry_every_frames;
-    let retries_per_id = config.retries_per_id;
-    let memory_copy_enabled = config.memory_copy_enabled;
-    let bank_file_dirs = config.bank_file_dirs.clone();
-    let mut finished = false;
-
-    install_recurring_task(
-        cs_task,
-        api,
-        CSTaskGroupIndex::SoundStep,
-        move |_: &FD4TaskData| {
-            if finished {
-                return;
-            }
-
-            frame = frame.wrapping_add(1);
-            if frame % retry_every_frames != 1 {
-                return;
-            }
-
-            let mut all_done = true;
-            for pending_bank in &mut pending {
-                if pending_bank.done {
-                    continue;
-                }
-
-                if pending_bank.attempts >= retries_per_id {
-                    append_log(
-                        &log_path,
-                        &format!(
-                            "bank id={} stopped after {} attempts",
-                            pending_bank.id, retries_per_id
-                        ),
-                    );
-                    pending_bank.done = true;
-                    continue;
-                }
-
-                pending_bank.attempts = pending_bank.attempts.saturating_add(1);
-                match unsafe {
-                    request_sound_bank(pending_bank.id, memory_copy_enabled, &bank_file_dirs, api)
-                } {
-                    Ok(message) => {
-                        append_log(
-                            &log_path,
-                            &format!(
-                                "bank id={} attempt={} {message}",
-                                pending_bank.id, pending_bank.attempts
-                            ),
-                        );
-                        pending_bank.done = true;
-                    }
-                    Err(message) => {
-                        append_log(
-                            &log_path,
-                            &format!(
-                                "bank id={} attempt={} failed: {message}",
-                                pending_bank.id, pending_bank.attempts
-                            ),
-                        );
-                        all_done = false;
-                    }
-                }
-            }
-
-            if all_done || pending.iter().all(|item| item.done) {
-                append_log(&log_path, "sound_bank_loader finished");
-                finished = true;
-            }
-        },
-    );
-}
-
-fn start_conditional_scheduler(
-    cs_task: &'static CSTaskImp,
-    api: RuntimeApi,
-    log_path: Option<PathBuf>,
-    config: Config,
-) {
-    if config.condition_bank_mappings.is_empty() && config.sp_effect_bank_mappings.is_empty() {
-        append_log(
-            &log_path,
-            "conditional mode has no condition_bank_mappings or sp_effect_bank_mappings",
+        phases.push(
+            file.phase("FileStepUpdate_Begin")
+                .map_err(|e| e.to_string())?,
         );
-        return;
     }
-    if !config.memory_copy_enabled {
-        append_log(
-            &log_path,
-            "conditional mode requires memory_copy_enabled=true",
-        );
-        return;
-    }
-
-    append_log(
-        &log_path,
-        "conditional sound_bank_loader scheduler installed on FrameBegin; scanning all players",
-    );
-
-    let bank_file_dirs = config.bank_file_dirs.clone();
-    let sp_atkcategory_mappings = config.condition_bank_mappings.clone();
-    let sp_effect_mappings = config.sp_effect_bank_mappings.clone();
-    let watched_sp_effect_ids = sp_effect_mappings
-        .iter()
-        .map(|mapping| mapping.condition_id)
-        .collect::<HashSet<_>>();
-    let hand = config.condition_hand;
-    let poll_every_frames = config.poll_every_frames.max(1);
-    let unload_when_inactive = config.unload_when_inactive;
-    let mut state = ConditionalState::default();
-
-    install_recurring_task(
-        cs_task,
-        api,
-        CSTaskGroupIndex::FrameBegin,
-        move |_: &FD4TaskData| {
-            state.frame = state.frame.wrapping_add(1);
-            if poll_every_frames > 1 && !state.frame.is_multiple_of(poll_every_frames) {
-                return;
-            }
-
-            let snapshot = detect_player_conditions(hand, &watched_sp_effect_ids);
-            if state.last_player_count != Some(snapshot.player_count)
-                || state.last_sp_atkcategories != snapshot.sp_atkcategories
-                || state.last_sp_effect_ids != snapshot.sp_effect_ids
-            {
-                let mut sorted_sp_atkcategories = snapshot
-                    .sp_atkcategories
-                    .iter()
-                    .copied()
-                    .collect::<Vec<_>>();
-                sorted_sp_atkcategories.sort_unstable();
-                let mut sorted_sp_effect_ids =
-                    snapshot.sp_effect_ids.iter().copied().collect::<Vec<_>>();
-                sorted_sp_effect_ids.sort_unstable();
-                append_log(
-                    &log_path,
-                    &format!(
-                        "player conditions changed players={} sp_atkcategories={sorted_sp_atkcategories:?} sp_effects={sorted_sp_effect_ids:?}",
-                        snapshot.player_count
-                    ),
-                );
-                state.last_player_count = Some(snapshot.player_count);
-                state.last_sp_atkcategories = snapshot.sp_atkcategories.clone();
-                state.last_sp_effect_ids = snapshot.sp_effect_ids.clone();
-            }
-
-            let target_banks = target_banks_for_conditions(
-                &snapshot.sp_atkcategories,
-                &sp_atkcategory_mappings,
-                &snapshot.sp_effect_ids,
-                &sp_effect_mappings,
-            );
-            if unload_when_inactive {
-                unload_inactive_banks(&log_path, &target_banks, &mut state, api);
-            }
-            load_missing_banks(&log_path, &target_banks, &bank_file_dirs, &mut state, api);
-        },
-    );
-}
-
-fn wait_for_cs_task() -> Result<&'static CSTaskImp, String> {
     let started = Instant::now();
-    let timeout = Duration::from_secs(60);
-
     loop {
-        let current_error = match unsafe { CSTaskImp::instance() } {
-            Ok(cs_task) => return Ok(cs_task),
-            Err(InstanceError::NotFound(name)) => format!("singleton not found: {name}"),
-            Err(InstanceError::Null(name)) => format!("singleton not initialized: {name}"),
-        };
-
-        if started.elapsed() >= timeout {
-            return Err(format!(
-                "CSTaskImp was unavailable after {} seconds ({})",
-                timeout.as_secs(),
-                current_error
-            ));
+        let catalog = file
+            .bind(&CurrentProcess, base)
+            .map_err(|e| e.to_string())?;
+        let mut ready = true;
+        for phase in &phases {
+            match catalog
+                .observe_phase(*phase)
+                .map_err(|e| e.to_string())?
+                .and_then(|v| v.native_group_id())
+            {
+                Some(id)
+                    if catalog
+                        .registered_group(id, 4096)
+                        .map_err(|e| e.to_string())?
+                        .is_some() => {}
+                _ => {
+                    ready = false;
+                    break;
+                }
+            }
+        }
+        if ready {
+            break;
+        }
+        if started.elapsed() >= Duration::from_secs(60) {
+            return Err("current task groups unavailable after60seconds".into());
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    if config.sfx.enabled
+        && let Err(error) = sfx::start(bytes.clone(), base, log.clone(), config)
+    {
+        append_log(
+            log,
+            &format!("SFX installation failed: {error}; independent sound path continues"),
+        );
+    }
+    // Original conditional mode bypasses static preload. Empty/invalid conditions do not load static IDs.
+    if config.conditional_enabled
+        && (config.condition_bank_mappings.is_empty() && config.sp_effect_bank_mappings.is_empty()
+            || !config.memory_copy_enabled)
+    {
+        append_log(
+            log,
+            "conditional mode has no mappings or memory_copy_enabled=false; SFX remains independent",
+        );
+        return Ok(());
+    }
+    if !config.conditional_enabled && config.sound_bank_ids.is_empty() {
+        return Ok(());
+    }
+    let configured = ResidentSoundBankConfig {
+        epoch: 1,
+        schedule: config.schedule(),
+        conditions: condition_config(
+            config.condition_hand,
+            &config.condition_bank_mappings,
+            &config.sp_effect_bank_mappings,
+        ),
+        reference_limit: 1024,
+    };
+    let installed = unsafe {
+        SOUND.install_current(
+            bytes,
+            base,
+            configured,
+            Files {
+                dirs: config.bank_file_dirs.clone(),
+                log: log.clone(),
+            },
+            None,
+        )
+    }
+    .map_err(|e| e.to_string())?;
+    let control = installed.registration.map_err(|e| e.to_string())?;
+    append_log(
+        log,
+        &format!(
+            "SDK process PIN={} registered_all={} startup={:?} conditional={:?}",
+            installed.module_handle,
+            control.registered_all(),
+            control.startup_status(),
+            control.conditional_status()
+        ),
+    );
+    if !control.registered_all() {
+        return Err(
+            "partial sound installation retained; close queued on original callback".into(),
+        );
+    }
+    let mut previous = String::new();
+    loop {
+        if let Some(report) = control.last_report() {
+            let text = format!(
+                "SDK sound state={:?} error={:?} schedule={:?} close={:?}",
+                report.state, report.error, report.schedule, report.close
+            );
+            if text != previous {
+                append_log(log, &text);
+                previous = text;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
-
-fn install_recurring_task<F>(
-    cs_task: &'static CSTaskImp,
-    api: RuntimeApi,
-    group: CSTaskGroupIndex,
-    execute: F,
-) where
-    F: FnMut(&FD4TaskData) + Send + 'static,
-{
-    // The game owns this task for the remainder of the DLL's process lifetime.
-    let task = Box::leak(Box::new(RecurringTask::new(execute)));
-    unsafe { (api.register_task)(cs_task, group, task) };
-}
-
+#[cfg(test)]
 fn target_banks_for_conditions(
     sp_atkcategories: &HashSet<i32>,
     sp_atkcategory_mappings: &[ConditionBankMapping],
@@ -698,215 +538,10 @@ fn target_banks_for_conditions(
     target_banks
 }
 
-fn load_missing_banks(
-    log_path: &Option<PathBuf>,
-    target_banks: &HashSet<u32>,
-    bank_file_dirs: &[PathBuf],
-    state: &mut ConditionalState,
-    api: RuntimeApi,
-) {
-    for bank_id in target_banks {
-        if state.loaded_banks.contains_key(bank_id) {
-            continue;
-        }
-
-        match unsafe { load_bank_memory_copy_result(api, *bank_id, bank_file_dirs) } {
-            Ok(result) => {
-                state.loaded_banks.insert(*bank_id, result.tracked_bank);
-                append_log(
-                    log_path,
-                    &format!(
-                        "conditional loaded bank id={bank_id} ownership={}; {}",
-                        result.tracked_bank.ownership.as_str(),
-                        result.message,
-                    ),
-                );
-            }
-            Err(message) => {
-                append_log(
-                    log_path,
-                    &format!("conditional load failed bank id={bank_id}; {message}"),
-                );
-            }
-        }
-    }
-}
-
-fn unload_inactive_banks(
-    log_path: &Option<PathBuf>,
-    target_banks: &HashSet<u32>,
-    state: &mut ConditionalState,
-    api: RuntimeApi,
-) {
-    let inactive = state
-        .loaded_banks
-        .keys()
-        .copied()
-        .filter(|bank_id| !target_banks.contains(bank_id))
-        .collect::<Vec<_>>();
-    if inactive.is_empty() {
-        return;
-    }
-
-    for bank_id in inactive {
-        let Some(tracked_bank) = state.loaded_banks.remove(&bank_id) else {
-            continue;
-        };
-
-        if tracked_bank.ownership == BankOwnership::External {
-            append_log(
-                log_path,
-                &format!(
-                    "conditional released bank id={bank_id} loaded_bank_id=0x{:08X}; unload skipped ownership=external (bank pre-existed in Wwise)",
-                    tracked_bank.loaded_bank_id
-                ),
-            );
-            continue;
-        }
-
-        let message = unsafe { unload_bank(api, tracked_bank.loaded_bank_id) };
-        append_log(
-            log_path,
-            &format!(
-                "conditional unloaded bank id={bank_id} loaded_bank_id=0x{:08X} ownership=loader; {message}",
-                tracked_bank.loaded_bank_id
-            ),
-        );
-    }
-}
-
-unsafe fn request_sound_bank(
-    id: u32,
-    memory_copy_enabled: bool,
-    bank_file_dirs: &[PathBuf],
-    api: RuntimeApi,
-) -> Result<String, String> {
-    if !memory_copy_enabled {
-        return Err(
-            "memory_copy_enabled=false is unsupported; FD4 filecap loading was removed".to_string(),
-        );
-    }
-
-    unsafe { load_bank_memory_copy_result(api, id, bank_file_dirs) }.map(|result| result.message)
-}
-
-unsafe fn load_bank_memory_copy_result(
-    api: RuntimeApi,
-    id: u32,
-    bank_file_dirs: &[PathBuf],
-) -> Result<LoadBankResult, String> {
-    let Some(bank_path) = find_bank_file(id, bank_file_dirs) else {
-        return Err(format!(
-            "bank file not found for id={id} searched_dirs={bank_file_dirs:?}"
-        ));
-    };
-
-    let bytes = fs::read(&bank_path)
-        .map_err(|err| format!("read {} failed: {err}", bank_path.display()))?;
-    if bytes.is_empty() {
-        return Err(format!("{} is empty", bank_path.display()));
-    }
-    if bytes.len() > u32::MAX as usize {
-        return Err(format!(
-            "{} is too large: {}",
-            bank_path.display(),
-            bytes.len()
-        ));
-    }
-
-    let mut loaded_bank_id = 0u32;
-    let result = unsafe {
-        (api.load_bank_memory_copy)(
-            bytes.as_ptr() as *const c_void,
-            bytes.len() as u32,
-            &mut loaded_bank_id,
-        )
-    };
-
-    let result_name = ak_result_name(result);
-    let message = format!(
-        "memory_copy path={} size={} fn=eldenring.exe+0x{:X} ak_result={}({result_name}) loaded_bank_id={} 0x{:08X}",
-        bank_path.display(),
-        bytes.len(),
-        api.load_bank_memory_copy_rva,
-        result,
-        loaded_bank_id,
-        loaded_bank_id
-    );
-
-    if let Some(ownership) = bank_ownership_for_load_result(result) {
-        Ok(LoadBankResult {
-            tracked_bank: TrackedBank {
-                loaded_bank_id,
-                ownership,
-            },
-            message,
-        })
-    } else {
-        Err(message)
-    }
-}
-
-unsafe fn unload_bank(api: RuntimeApi, loaded_bank_id: u32) -> String {
-    let result = unsafe { (api.unload_bank)(loaded_bank_id, std::ptr::null()) };
-    let result_name = ak_result_name(result);
-
-    format!(
-        "unload_bank fn=eldenring.exe+0x{:X} ak_result={}({result_name})",
-        api.unload_bank_rva, result
-    )
-}
-
-fn detect_player_conditions(
-    hand_mode: HandMode,
-    watched_sp_effect_ids: &HashSet<i32>,
-) -> ConditionSnapshot {
-    let mut snapshot = ConditionSnapshot::default();
-    let Ok(world_chr_man) = (unsafe { WorldChrMan::instance() }) else {
-        return snapshot;
-    };
-    let repo = unsafe { SoloParamRepository::instance() }.ok();
-
-    for player in world_chr_man.player_chr_set.characters() {
-        snapshot.player_count += 1;
-        if let Some(repo) = repo
-            && let Some(condition_id) =
-                player_sp_atkcategory(player.chr_asm.as_ref(), hand_mode, repo)
-        {
-            snapshot.sp_atkcategories.insert(condition_id);
-        }
-
-        for entry in player.chr_ins.special_effect.entries() {
-            if watched_sp_effect_ids.contains(&entry.param_id) {
-                snapshot.sp_effect_ids.insert(entry.param_id);
-            }
-        }
-    }
-
-    snapshot
-}
-
-fn player_sp_atkcategory(
-    chr_asm: &ChrAsm,
-    hand_mode: HandMode,
-    repo: &SoloParamRepository,
-) -> Option<i32> {
-    let hand = active_hand(hand_mode, chr_asm);
-    let slot_index = active_weapon_slot_index(chr_asm, hand)?;
-    let param_id = chr_asm.equipment_param_ids.get(slot_index).copied()?;
-    if param_id <= 0 {
-        return None;
-    }
-
-    let weapon = repo.get::<EquipParamWeapon>(((param_id as u32) / 100) * 100)?;
-    Some(weapon.sp_atkcategory() as i32)
-}
-
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use pelite::pe64::PeFile;
 
     #[test]
     fn target_banks_are_union_of_all_player_conditions() {
@@ -1022,81 +657,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_symbols_resolve_from_configured_game_executable() {
-        let Some(path) = std::env::var_os("ER_GAME_EXE").map(PathBuf::from) else {
-            eprintln!("ER_GAME_EXE is not set; static game compatibility check skipped");
-            return;
-        };
-
-        let bytes = fs::read(&path)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-        let pe = PeFile::from_bytes(&bytes)
-            .unwrap_or_else(|err| panic!("failed to parse {}: {err:?}", path.display()));
-        let register_task_rva = resolve_register_task_rva(pe)
-            .unwrap_or_else(|err| panic!("register_task compatibility check failed: {err}"));
-        let load_bank_memory_copy_rva = resolve_export_rva(pe, LOAD_BANK_MEMORY_COPY_EXPORT)
-            .unwrap_or_else(|err| panic!("LoadBankMemoryCopy compatibility check failed: {err}"));
-        let unload_bank_rva = resolve_export_rva(pe, UNLOAD_BANK_EXPORT)
-            .unwrap_or_else(|err| panic!("UnloadBank compatibility check failed: {err}"));
-        let text = pe
-            .section_headers()
-            .by_name(".text")
-            .and_then(|section| pe.get_section_bytes(section).ok())
-            .expect(".text section missing or malformed");
-        let fd4_singleton_candidates = from_singleton::find::fd4_singleton_pat_iter(text).count();
-        assert!(
-            fd4_singleton_candidates > 0,
-            "FD4 singleton reflection signature produced no candidates"
-        );
-        for name in [
-            b"CSTask\0".as_slice(),
-            b"WorldChrMan\0",
-            b"SoloParamRepository\0",
-        ] {
-            assert!(
-                bytes.windows(name.len()).any(|window| window == name),
-                "required DLRF singleton name {} was not found",
-                String::from_utf8_lossy(&name[..name.len() - 1])
-            );
-        }
-
-        assert_ne!(register_task_rva, 0);
-        assert_ne!(load_bank_memory_copy_rva, 0);
-        assert_ne!(unload_bank_rva, 0);
-        assert_ne!(load_bank_memory_copy_rva, unload_bank_rva);
-        println!(
-            "compatible executable={} register_task=0x{register_task_rva:X} LoadBankMemoryCopy=0x{load_bank_memory_copy_rva:X} UnloadBank=0x{unload_bank_rva:X} fd4_singleton_candidates={fd4_singleton_candidates} required_singleton_names=ok",
-            path.display(),
-        );
+    fn fixed_sdk_gate_rejects_original_test_executable_without_loaded_reads() {
+        let bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
+        assert!(Ww171File::verify(&bytes).is_err());
     }
-}
-
-fn active_hand(hand_mode: HandMode, chr_asm: &ChrAsm) -> ActiveHand {
-    match hand_mode {
-        HandMode::Left => ActiveHand::Left,
-        HandMode::Right => ActiveHand::Right,
-        HandMode::Auto => match chr_asm.equipment.arm_style {
-            ChrAsmArmStyle::LeftBothHands => ActiveHand::Left,
-            _ => ActiveHand::Right,
-        },
-    }
-}
-
-fn active_weapon_slot_index(chr_asm: &ChrAsm, hand: ActiveHand) -> Option<usize> {
-    let slots = &chr_asm.equipment.selected_slots;
-    let slot = match hand {
-        ActiveHand::Left => slots.left_weapon_slot,
-        ActiveHand::Right => slots.right_weapon_slot,
-    };
-
-    if slot > 2 {
-        return None;
-    }
-
-    Some(match hand {
-        ActiveHand::Left => (slot * 2) as usize,
-        ActiveHand::Right => (slot * 2 + 1) as usize,
-    })
 }
 
 fn find_bank_file(id: u32, bank_file_dirs: &[PathBuf]) -> Option<PathBuf> {
@@ -1277,31 +841,12 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+#[cfg(test)]
 fn bank_ownership_for_load_result(result: i32) -> Option<BankOwnership> {
     match result {
         AK_SUCCESS => Some(BankOwnership::Loader),
         AK_BANK_ALREADY_LOADED => Some(BankOwnership::External),
         _ => None,
-    }
-}
-
-fn ak_result_name(result: i32) -> &'static str {
-    match result {
-        1 => "AK_Success",
-        2 => "AK_Fail",
-        7 => "AK_InvalidFile",
-        14 => "AK_InvalidID",
-        16 => "AK_NoMoreData",
-        31 => "AK_InvalidParameter",
-        52 => "AK_InsufficientMemory",
-        56 => "AK_UnknownBankID",
-        64 => "AK_BankReadError",
-        65 => "AK_InvalidSwitchType",
-        66 => "AK_FormatNotReady",
-        67 => "AK_WrongBankVersion",
-        68 => "AK_FileNotFound",
-        69 => "AK_BankAlreadyLoaded",
-        _ => "unknown",
     }
 }
 
@@ -1331,3 +876,7 @@ fn append_log(path: &Option<PathBuf>, message: &str) {
         let _ = writeln!(file, "{message}");
     }
 }
+
+#[cfg(test)]
+#[path = "sdk_tests.rs"]
+mod sdk_tests;

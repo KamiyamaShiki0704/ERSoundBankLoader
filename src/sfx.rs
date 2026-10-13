@@ -10,11 +10,27 @@ use std::{
 use pelite::pe64::{Pe, PeView};
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
 
+#[cfg(test)]
+use crate::target_banks_for_conditions;
 use crate::{
-    CSTaskGroupIndex, CSTaskImp, ConditionBankMapping, Config, FD4TaskData, RuntimeApi, append_log,
-    detect_player_conditions, install_recurring_task, parse_bool, parse_condition_bank_mappings,
-    target_banks_for_conditions,
+    ConditionBankMapping, Config, append_log, condition_config, parse_bool,
+    parse_condition_bank_mappings,
 };
+use shikifsrs_elden_ring::{
+    TaskCallback, TaskPhase, Ww171File, current_sound_conditions::CurrentSoundConditions,
+    current_tasks::CurrentTaskEngine, task_resident::ResidentCallbackGroupSlot,
+};
+use std::{
+    cell::RefCell,
+    thread::{self, ThreadId},
+};
+static TASKS: ResidentCallbackGroupSlot<2> = ResidentCallbackGroupSlot::new();
+thread_local! { static READER: RefCell<Option<Result<CurrentSoundConditions,String>>> = const { RefCell::new(None) }; }
+#[derive(Default)]
+struct Demand {
+    targets: HashSet<u32>,
+    blocked: bool,
+}
 
 #[derive(Clone)]
 pub(super) struct Settings {
@@ -89,12 +105,6 @@ fn parse_mapping(value: &str, target: &mut Vec<ConditionBankMapping>, invalid: &
     } else {
         target.extend(mappings);
     }
-}
-
-fn sorted_ids(ids: &HashSet<i32>) -> Vec<i32> {
-    let mut ids = ids.iter().copied().collect::<Vec<_>>();
-    ids.sort_unstable();
-    ids
 }
 
 #[cfg(test)]
@@ -365,14 +375,11 @@ mod tests {
     }
 
     #[test]
-    fn supported_profiles_keep_independent_addresses_and_reject_unknown_identity() {
-        let old = select_profile(0x69e9c9b9, 0x5e09600).unwrap();
+    fn fixed_current_profile_rejects_previous_and_unknown_identity() {
         let new = select_profile(0x6a96b418, 0x5e0da00).unwrap();
-        assert_eq!(old.code[0].1, 0xd90cf0);
         assert_eq!(new.code[0].1, 0xd90d60);
-        assert_eq!(old.code[1].1, 0xd91020);
         assert_eq!(new.code[1].1, 0xd91090);
-        assert_eq!(old.code[2].1, new.code[2].1);
+        assert!(select_profile(0x69e9c9b9, 0x5e09600).is_err());
         assert!(select_profile(0x6a96b418, 0x5e09600).is_err());
         assert!(select_profile(0, 0).is_err());
     }
@@ -408,114 +415,160 @@ mod tests {
 }
 
 pub(super) fn start(
-    task: &'static CSTaskImp,
-    api: RuntimeApi,
+    bytes: Arc<[u8]>,
+    base: u64,
     log: Option<PathBuf>,
     config: &Config,
-) {
+) -> Result<(), String> {
     if config.sfx.invalid
         || (config.sfx.weapon_mappings.is_empty() && config.sfx.sp_effect_mappings.is_empty())
     {
-        append_log(
-            &log,
-            "sfx disabled: invalid settings or no SFX weapon/SpEffect mappings",
-        );
-        return;
+        append_log(&log, "sfx disabled: invalid settings or no mappings");
+        return Ok(());
     }
-    let backend = match unsafe { Native::resolve() } {
-        Ok(backend) => backend,
-        Err(error) => {
-            append_log(
-                &log,
-                &format!("sfx disabled: {error}; sound behavior unchanged"),
-            );
+    let file = Ww171File::verify(&bytes).map_err(|e| e.to_string())?;
+    let resource_phase = file
+        .phase("FileStepUpdate_Begin")
+        .map_err(|e| e.to_string())?;
+    let engine =
+        unsafe { CurrentTaskEngine::bind(bytes.clone(), base) }.map_err(|e| e.to_string())?;
+    let demand = Arc::new(Mutex::new(Demand::default()));
+    let publisher = demand.clone();
+    let condition_log = log.clone();
+    let reader_config = condition_config(
+        config.condition_hand,
+        &config.sfx.weapon_mappings,
+        &config.sfx.sp_effect_mappings,
+    );
+    let reader_bytes = bytes.clone();
+    let poll = config.poll_every_frames.max(1);
+    let mut frame = 0u64;
+    let condition = TaskCallback::new(move |_| {
+        frame = frame.saturating_add(1);
+        if !frame.is_multiple_of(u64::from(poll)) {
             return;
         }
-    };
-    append_log(
-        &log,
-        &format!(
-            "sfx enabled for ER {}: weapon_mappings={} sp_effect_mappings={} ready_timeout_ms={}; FrameBegin demand -> FileStepUpdate_Begin resources; concurrency remains experimental",
-            backend.profile.version,
-            config.sfx.weapon_mappings.len(),
-            config.sfx.sp_effect_mappings.len(),
-            config.sfx.ready_timeout_ms,
-        ),
-    );
-    let demand = Arc::new(Mutex::new(HashSet::new()));
-    let publisher = Arc::clone(&demand);
-    let hand = config.condition_hand;
-    let weapon_mappings = config.sfx.weapon_mappings.clone();
-    let sp_effect_mappings = config.sfx.sp_effect_mappings.clone();
-    let watched_sp_effects = sp_effect_mappings
-        .iter()
-        .map(|mapping| mapping.condition_id)
-        .collect::<HashSet<_>>();
-    let poll = config.poll_every_frames.max(1);
-    let mut frame = 0u32;
-    let condition_log = log.clone();
-    install_recurring_task(
-        task,
-        api,
-        CSTaskGroupIndex::FrameBegin,
-        move |_: &FD4TaskData| {
-            frame = frame.wrapping_add(1);
-            if !frame.is_multiple_of(poll) {
-                return;
+        let result = READER.with(|slot| {
+            let mut state = slot.borrow_mut();
+            if state.is_none() {
+                *state = Some(
+                    unsafe {
+                        CurrentSoundConditions::bind(
+                            reader_bytes.clone(),
+                            base,
+                            None,
+                            reader_config.clone(),
+                        )
+                    }
+                    .map_err(|e| e.to_string()),
+                );
             }
-            let snapshot = detect_player_conditions(hand, &watched_sp_effects);
-            let next = target_banks_for_conditions(
-                &snapshot.sp_atkcategories,
-                &weapon_mappings,
-                &snapshot.sp_effect_ids,
-                &sp_effect_mappings,
-            );
-            if let Ok(mut current) = publisher.lock()
-                && *current != next
-            {
-                let mut sorted = next.iter().copied().collect::<Vec<_>>();
-                sorted.sort_unstable();
+            match state.as_ref().unwrap() {
+                Ok(reader) => reader.targets(1).map_err(|e| e.to_string()),
+                Err(error) => Err(error.clone()),
+            }
+        });
+        let Ok(mut state) = publisher.lock() else {
+            return;
+        };
+        if state.blocked {
+            return;
+        }
+        match result {
+            Ok(Some(targets)) => {
+                let next = targets.into_iter().collect::<HashSet<_>>();
+                if state.targets != next {
+                    append_log(&condition_log, &format!("sfx desired bank IDs={next:?}"));
+                    state.targets = next;
+                }
+            }
+            Ok(None) => {
+                state.targets.clear();
+            }
+            Err(error) => {
+                state.blocked = true;
                 append_log(
                     &condition_log,
                     &format!(
-                        "sfx demand banks={sorted:?} players={} matched_sp_effects={:?}",
-                        snapshot.player_count,
-                        sorted_ids(&snapshot.sp_effect_ids),
+                        "sfx condition ERROR={error}; retained resources, no subsequent native calls"
                     ),
                 );
-                *current = next;
             }
-        },
-    );
-    let mut driver = Driver::new(backend, config.sfx.ready_timeout_ms);
+        }
+    });
+    let timeout = config.sfx.ready_timeout_ms;
+    let mut driver: Option<Driver<Native>> = None;
+    let mut original_thread: Option<ThreadId> = None;
     let started = Instant::now();
-    install_recurring_task(
-        task,
-        api,
-        CSTaskGroupIndex::FileStepUpdate_Begin,
-        move |_: &FD4TaskData| {
-            let Ok(current) = demand.lock().map(|value| value.clone()) else {
-                return;
-            };
-            for event in driver.tick(&current, started.elapsed().as_millis() as u64) {
-                append_log(&log, &format!("sfx {event}"));
+    let mut stopped = false;
+    let resource = TaskCallback::new(move |_| {
+        if stopped {
+            return;
+        }
+        let current_thread = thread::current().id();
+        if original_thread.is_some_and(|id| id != current_thread) {
+            stopped = true;
+            append_log(
+                &log,
+                "sfx callback thread changed; retained references, stopped",
+            );
+            return;
+        }
+        original_thread = Some(current_thread);
+        let Ok(state) = demand.lock() else {
+            stopped = true;
+            return;
+        };
+        if state.blocked {
+            stopped = true;
+            return;
+        }
+        let current = state.targets.clone();
+        drop(state);
+        if driver.is_none() {
+            match unsafe { Native::resolve() } {
+                Ok(backend) => {
+                    append_log(
+                        &log,
+                        &format!(
+                            "sfx owned resource adapter ER{}; phase/lifetime experimental",
+                            backend.profile.version
+                        ),
+                    );
+                    driver = Some(Driver::new(backend, timeout));
+                }
+                Err(error) => {
+                    append_log(&log, &format!("sfx adapter rejected: {error}"));
+                    stopped = true;
+                    return;
+                }
             }
-        },
-    );
+        }
+        let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        for event in driver.as_mut().unwrap().tick(&current, now) {
+            append_log(&log, &format!("sfx {event}"));
+        }
+    });
+    let installed = unsafe {
+        TASKS.install(
+            engine,
+            [TaskPhase::FRAME_BEGIN, resource_phase],
+            [condition, resource],
+        )
+    }
+    .map_err(|e| e.to_string())?;
+    let control = installed.registration.map_err(|e| e.to_string())?;
+    if !control.registered_all() {
+        control.stop_callbacks();
+        return Err(
+            "partial SFX task registration retained; no resource callback registered".into(),
+        );
+    }
+    Ok(())
 }
 
-// Code fingerprints guard this experimental ABI against accidental version/patch changes.
-const CODE_270: &[(&str, u32, usize, u64)] = &[
-    ("path_acquire", 0xd90cf0, 0x208, 0x5b1fc0ea256532f0),
-    ("release_cap", 0xd91020, 0x56, 0x2bb6d543d5b79bbd),
-    ("ffxbnd_factory", 0x1f1d10, 0x123, 0x8d63c5610997e392),
-    ("collector", 0xd931c0, 0x298, 0xd1d21fdef2f60ee4),
-    ("csfile_release", 0x2654170, 0x94, 0x6402dc4629687677),
-    ("reference_release", 0x2654210, 0x76, 0x9dbe686227bb6ef3),
-    ("increment_use", 0x20f2b0, 0x7, 0xe3741b79a0cd5043),
-    ("decrement_use", 0x20f320, 0x1e, 0x0092f536dab1d5f3),
-];
-
+// Current-version native SFX code belongs to the original consumer. It is retained
+// with its original raw guards, independently from SDK task/condition replacement.
 const CODE_271: &[(&str, u32, usize, u64)] = &[
     ("path_acquire", 0xd90d60, 0x208, 0xca1c34d3b16b4032),
     ("release_cap", 0xd91090, 0x56, 0x771e160290158dfe),
@@ -535,28 +588,18 @@ struct Profile {
     code: &'static [(&'static str, u32, usize, u64)],
 }
 
-const PROFILES: &[Profile] = &[
-    Profile {
-        version: "2.7.0.0",
-        timestamp: 0x69e9c9b9,
-        image_size: 0x5e09600,
-        code: CODE_270,
-    },
-    Profile {
-        version: "2.7.1.0",
-        timestamp: 0x6a96b418,
-        image_size: 0x5e0da00,
-        code: CODE_271,
-    },
-];
+const PROFILES: &[Profile] = &[Profile {
+    version: "2.7.1.0",
+    timestamp: 0x6a96b418,
+    image_size: 0x5e0da00,
+    code: CODE_271,
+}];
 
 fn select_profile(timestamp: u32, image_size: u32) -> Result<&'static Profile, String> {
     PROFILES
         .iter()
         .find(|p| p.timestamp == timestamp && p.image_size == image_size)
-        .ok_or_else(|| {
-            "unsupported executable identity; SFX requires inspected ER 2.7.0.0 or 2.7.1.0".into()
-        })
+        .ok_or_else(|| "unsupported executable identity; SFX requires fixed ER 2.7.1.0".into())
 }
 
 fn fingerprint(bytes: &[u8]) -> u64 {

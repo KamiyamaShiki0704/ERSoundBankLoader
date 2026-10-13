@@ -1,3 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["."]
+
 [package]
 name = "er-sound-bank-loader"
 version = "0.4.1"
@@ -6,13 +10,11 @@ license = "MIT"
 publish = false
 
 [dependencies]
-eldenring = { git = "https://github.com/vswarte/eldenring-rs.git", rev = "902851865d05069eda7dcfd6385c8881eadf29bf" }
-fromsoftware-shared = { git = "https://github.com/vswarte/eldenring-rs.git", rev = "902851865d05069eda7dcfd6385c8881eadf29bf" }
+shikifsrs-elden-ring = { git = "https://github.com/KamiyamaShiki0704/ShikiFSRS.git", rev = "930f818431e72209b49d2e37265a1f8150fa5390" }
+shikifsrs-runtime = { git = "https://github.com/KamiyamaShiki0704/ShikiFSRS.git", rev = "930f818431e72209b49d2e37265a1f8150fa5390" }
 pelite = "0.10"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
 
-[dev-dependencies]
-from-singleton = "3.0"
 
 [lib]
 crate-type = ["cdylib"]

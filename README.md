@@ -146,3 +146,9 @@ FD4 filecap requests alone were not enough to make sounds play, so that obsolete
 no longer called. The loader resolves the exported `LoadBankMemoryCopy` and `UnloadBank` functions by
 name, while the internal task-registration function is found with a unique runtime signature. This
 avoids tying the DLL to the function RVAs of one Elden Ring executable version.
+
+## Building with private ShikiFSRS
+
+Cargo pins `KamiyamaShiki0704/ShikiFSRS` to `930f818431e72209b49d2e37265a1f8150fa5390`. This SDK repository is private: the build account needs repository read access and Git credentials. `.cargo/config.toml` enables Git CLI fetching; no token is stored in this repository.
+
+The migration was checked offline against ER WW 1.17.1 (EXE 2.7.1.0). Native engine ownership, phase/lifetime requirements and unexecuted gameplay behavior remain experimental and require manual acceptance. Existing ignored game/asset fixtures were not executed.
