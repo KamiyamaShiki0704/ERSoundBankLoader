@@ -6,8 +6,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
-eldenring = { path = "../fromsoftware-rs/crates/eldenring" }
-fromsoftware-shared = { path = "../fromsoftware-rs/crates/shared" }
+eldenring = { git = "https://github.com/KamiyamaShiki0704/fromsoftware-rs", rev = "dd7b5a1d71169a3d3cbdfc619ecd72be169f17d5" }
+fromsoftware-shared = { git = "https://github.com/KamiyamaShiki0704/fromsoftware-rs", rev = "dd7b5a1d71169a3d3cbdfc619ecd72be169f17d5" }
 pelite = "0.10"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
 
