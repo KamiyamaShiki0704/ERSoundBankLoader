@@ -1,3 +1,5 @@
+> 2026-10-21 compatibility build: ER App 1.17.2 / EXE 2.7.2.0. The candidate in `dist/er-1.17.2/` passed automated checks and is installed in the main `_GoldenAge` Mod. In-game acceptance is pending. Current spec, hashes, rollback and evidence: [1.17.2 build record](../../Topics/Gameplay/bug-er-1-17-2-dll-compat/build.md). Earlier version/publication notes below retain their original scope.
+
 # ERSoundBankLoader
 
 Elden Ring DLL for preloading character Sound Banks without spawning hidden 0-HP enemies.
@@ -13,7 +15,7 @@ Elden Ring DLL for preloading character Sound Banks without spawning hidden 0-HP
 - Loads the mapped `cs_c####.bnk` file with `AK::SoundEngine::LoadBankMemoryCopy`.
 - Keeps a mapped bank loaded while any local or remote player matches either trigger type.
 - Unloads previously loaded dynamic banks with `AK::SoundEngine::UnloadBank` when no player matches.
-- Never unloads a bank that was already present in Wwise before the DLL requested it.
+- Preserves banks already present in Wwise and banks subsequently needed by native characters.
 - Conditionally requests native `SfxBnd_c####.ffxbnd` SFX Banks by weapon `sp_atkcategory` or
   active SpEffect, with demand deduplicated across all players and both trigger types.
 - Releases only its own SFX Bank reference after the last matching condition ends; native resource
@@ -100,10 +102,23 @@ loaded until every matching weapon and SpEffect trigger has become inactive. Sou
 local to each game process, so every player who needs to hear these sounds must install the DLL and
 the same `.bnk` files.
 
-The loader tracks bank ownership from the result of `LoadBankMemoryCopy`. `AK_Success` means the DLL
-performed the load and may later unload it. `AK_BankAlreadyLoaded` means the game or another system
-loaded it first; the DLL borrows that bank and skips `UnloadBank` when the weapon condition ends.
-This prevents mapped weapons from unloading a Sound Bank still needed by a map Boss.
+The loader initially tracks ownership from `LoadBankMemoryCopy`. `AK_BankAlreadyLoaded` means the
+Bank already existed; the DLL borrows it and skips `UnloadBank` when its conditions end.
+`AK_Success` initially gives the DLL permission to unload its own load.
+
+While holding that permission, each condition poll also checks native characters' primary and
+additional Sound Bank requirements, including the default character Bank. If a native character
+needs the same Bank, the DLL relinquishes unload permission for that tracked load. This also
+covers a Boss appearing after a weapon loaded its Bank. Switching weapons then leaves cleanup
+to the game, even if the character subsequently disappears. Banks used only by configured weapon
+or SpEffect triggers still unload normally. Incomplete scene or NpcParam inspection defers owned
+unloads until inspection recovers.
+
+This is conservative protection based on native character demand, not a Wwise ownership query.
+The log records `conditional protected bank`, `ownership=native_character` and incomplete-inspection
+deferrals. Native users entirely between polls and non-character users remain runtime limitations.
+See the [shared Sound Bank fix](Scripts/delivery/shared-sound-bank/build.md) for verification and
+the manual Boss test.
 
 The old comma-separated keys are still accepted for compatibility.
 

@@ -527,12 +527,29 @@ const CODE_271: &[(&str, u32, usize, u64)] = &[
     ("decrement_use", 0x20f320, 0x1e, 0x0092f536dab1d5f3),
 ];
 
+// Full inspected ranges retain their non-address operands (consumer-native-evidence.json).
+const CODE_272: &[(&str, u32, usize, u64)] = &[
+    ("path_acquire", 0xd92450, 0x208, 0x632edc340c0361f1),
+    ("release_cap", 0xd92780, 0x56, 0x41e0eb5e749677a5),
+    ("ffxbnd_factory", 0x1f1d10, 0x123, 0x8c1ae85932a4bd99),
+    ("collector", 0xd94920, 0x298, 0x898b941be949f813),
+    ("csfile_release", 0x2655910, 0x94, 0x1554235c4a7069a4),
+    ("reference_release", 0x26559b0, 0x76, 0x9dbe686227bb6ef3),
+    ("increment_use", 0x20f2b0, 0x7, 0xe3741b79a0cd5043),
+    ("decrement_use", 0x20f320, 0x1e, 0x0092f536dab1d5f3),
+];
+
 #[derive(Debug)]
 struct Profile {
     version: &'static str,
     timestamp: u32,
     image_size: u32,
     code: &'static [(&'static str, u32, usize, u64)],
+    manager_global: usize,
+    file_global: usize,
+    manager_vtable: usize,
+    file_vtable: usize,
+    cap_vtable: usize,
 }
 
 const PROFILES: &[Profile] = &[
@@ -541,12 +558,33 @@ const PROFILES: &[Profile] = &[
         timestamp: 0x69e9c9b9,
         image_size: 0x5e09600,
         code: CODE_270,
+        manager_global: 0x3d87a28,
+        file_global: 0x3d5f158,
+        manager_vtable: 0x2bc31a0,
+        file_vtable: 0x29d4800,
+        cap_vtable: 0x29daae0,
     },
     Profile {
         version: "2.7.1.0",
         timestamp: 0x6a96b418,
         image_size: 0x5e0da00,
         code: CODE_271,
+        manager_global: 0x3d87a28,
+        file_global: 0x3d5f158,
+        manager_vtable: 0x2bc31a0,
+        file_vtable: 0x29d4800,
+        cap_vtable: 0x29daae0,
+    },
+    Profile {
+        version: "2.7.2.0",
+        timestamp: 0x6aabf7e7,
+        image_size: 0x5dfd600,
+        code: CODE_272,
+        manager_global: 0x3d8aa48,
+        file_global: 0x3d62178,
+        manager_vtable: 0x2bc5450,
+        file_vtable: 0x29d6800,
+        cap_vtable: 0x29dcae0,
     },
 ];
 
@@ -555,7 +593,8 @@ fn select_profile(timestamp: u32, image_size: u32) -> Result<&'static Profile, S
         .iter()
         .find(|p| p.timestamp == timestamp && p.image_size == image_size)
         .ok_or_else(|| {
-            "unsupported executable identity; SFX requires inspected ER 2.7.0.0 or 2.7.1.0".into()
+            "unsupported executable identity; SFX requires inspected ER 2.7.0.0, 2.7.1.0 or 2.7.2.0"
+                .into()
         })
 }
 
@@ -651,13 +690,13 @@ impl Native {
 
     fn current_context(&self) -> Result<Option<Context>, String> {
         unsafe {
-            let manager = Self::read::<usize>(self.base + 0x3d87a28);
-            let file = Self::read::<usize>(self.base + 0x3d5f158);
+            let manager = Self::read::<usize>(self.base + self.profile.manager_global);
+            let file = Self::read::<usize>(self.base + self.profile.file_global);
             if manager == 0 || file == 0 {
                 return Ok(None);
             }
-            if Self::read::<usize>(manager) != self.base + 0x2bc31a0
-                || Self::read::<usize>(file) != self.base + 0x29d4800
+            if Self::read::<usize>(manager) != self.base + self.profile.manager_vtable
+                || Self::read::<usize>(file) != self.base + self.profile.file_vtable
             {
                 return Err("CSSfx/CSFile vtable mismatch".into());
             }
@@ -740,7 +779,7 @@ impl Backend for Native {
             );
         }
         unsafe {
-            if Self::read::<usize>(handle) != self.base + 0x29daae0 {
+            if Self::read::<usize>(handle) != self.base + self.profile.cap_vtable {
                 return Err("retained cap is not the expected FfxbndFileCap".into());
             }
             let mut observation = Observation {

@@ -9,8 +9,8 @@ use std::{
 
 use eldenring::{
     cs::{
-        CSTaskGroupIndex, CSTaskImp, ChrAsm, ChrAsmArmStyle, EquipParamWeapon, SoloParamRepository,
-        WorldChrMan,
+        CSTaskGroupIndex, CSTaskImp, ChrAsm, ChrAsmArmStyle, ChrIns, EquipParamWeapon, NpcParam,
+        SoloParamRepository, WorldChrMan,
     },
     fd4::FD4TaskData,
 };
@@ -105,6 +105,13 @@ struct ConditionalState {
     last_sp_atkcategories: HashSet<i32>,
     last_sp_effect_ids: HashSet<i32>,
     loaded_banks: HashMap<u32, TrackedBank>,
+    native_scan_incomplete_logged: bool,
+}
+
+#[derive(Default)]
+struct NativeBankSnapshot {
+    bank_ids: HashSet<u32>,
+    complete: bool,
 }
 
 #[derive(Default)]
@@ -118,6 +125,7 @@ struct ConditionSnapshot {
 enum BankOwnership {
     Loader,
     External,
+    NativeCharacter,
 }
 
 impl BankOwnership {
@@ -125,6 +133,7 @@ impl BankOwnership {
         match self {
             Self::Loader => "loader",
             Self::External => "external",
+            Self::NativeCharacter => "native_character",
         }
     }
 }
@@ -157,6 +166,7 @@ struct RuntimeApi {
 
 impl RuntimeApi {
     unsafe fn resolve() -> Result<Self, String> {
+        eldenring::initialize_game_bindings()?;
         let exe = unsafe { GetModuleHandleA(None) }
             .map_err(|err| format!("GetModuleHandleA(None) failed: {err:?}"))?;
         let base = exe.0 as usize;
@@ -165,6 +175,13 @@ impl RuntimeApi {
         }
 
         let pe = unsafe { PeView::module(base as *const u8) };
+        if pe.file_header().TimeDateStamp == 0x6aabf7e7 {
+            let path = std::env::current_exe().map_err(|e| e.to_string())?;
+            let bytes = fs::read(path).map_err(|e| e.to_string())?;
+            if !eldenring::verify_ww272_file(&bytes) {
+                return Err("unverified WW 2.7.2 executable; no task or resource calls".into());
+            }
+        }
         let register_task_rva = resolve_register_task_rva(pe)?;
         let load_bank_memory_copy_rva = resolve_export_rva(pe, LOAD_BANK_MEMORY_COPY_EXPORT)?;
         let unload_bank_rva = resolve_export_rva(pe, UNLOAD_BANK_EXPORT)?;
@@ -237,7 +254,8 @@ pub unsafe extern "C" fn DllMain(hmodule: usize, reason: u32, _reserved: usize) 
         append_log(
             &log_path,
             &format!(
-                "loaded enabled={} log_enabled={} sound_bank_ids={:?} start_delay_ms={} retries_per_id={} retry_every_frames={} memory_copy_enabled={} bank_file_dirs={:?} conditional_enabled={} condition_hand={:?} condition_bank_mappings={} sp_effect_bank_mappings={} poll_every_frames={} unload_when_inactive={} sfx={}",
+                "loaded version={} enabled={} log_enabled={} sound_bank_ids={:?} start_delay_ms={} retries_per_id={} retry_every_frames={} memory_copy_enabled={} bank_file_dirs={:?} conditional_enabled={} condition_hand={:?} condition_bank_mappings={} sp_effect_bank_mappings={} poll_every_frames={} unload_when_inactive={} sfx={}",
+                env!("CARGO_PKG_VERSION"),
                 config.enabled,
                 config.log_enabled,
                 config.sound_bank_ids,
@@ -578,7 +596,7 @@ fn start_conditional_scheduler(
 
     append_log(
         &log_path,
-        "conditional sound_bank_loader scheduler installed on FrameBegin; scanning all players",
+        "conditional sound_bank_loader scheduler installed on FrameBegin; scanning all players and protecting native character banks",
     );
 
     let bank_file_dirs = config.bank_file_dirs.clone();
@@ -636,7 +654,14 @@ fn start_conditional_scheduler(
                 &sp_effect_mappings,
             );
             if unload_when_inactive {
-                unload_inactive_banks(&log_path, &target_banks, &mut state, api);
+                let candidates = state
+                    .loaded_banks
+                    .iter()
+                    .filter(|(_, bank)| bank.ownership == BankOwnership::Loader)
+                    .map(|(&id, _)| id)
+                    .collect();
+                let native_banks = detect_native_sound_banks(&candidates);
+                unload_inactive_banks(&log_path, &target_banks, &native_banks, &mut state, api);
             }
             load_missing_banks(&log_path, &target_banks, &bank_file_dirs, &mut state, api);
         },
@@ -735,9 +760,37 @@ fn load_missing_banks(
 fn unload_inactive_banks(
     log_path: &Option<PathBuf>,
     target_banks: &HashSet<u32>,
+    native_banks: &NativeBankSnapshot,
     state: &mut ConditionalState,
     api: RuntimeApi,
 ) {
+    // A later game load can share the bank without changing our original AKRESULT.
+    for (&bank_id, tracked_bank) in &mut state.loaded_banks {
+        if tracked_bank.ownership == BankOwnership::Loader
+            && native_banks.bank_ids.contains(&bank_id)
+        {
+            tracked_bank.ownership = BankOwnership::NativeCharacter;
+            append_log(
+                log_path,
+                &format!(
+                    "conditional protected bank id={bank_id} loaded_bank_id=0x{:08X}; native character demand observed, DLL unload ownership relinquished",
+                    tracked_bank.loaded_bank_id
+                ),
+            );
+        }
+    }
+    let defer_unload = !native_banks.complete
+        && state.loaded_banks.iter().any(|(id, bank)| {
+            bank.ownership == BankOwnership::Loader && !target_banks.contains(id)
+        });
+    if defer_unload && !state.native_scan_incomplete_logged {
+        append_log(
+            log_path,
+            "conditional unload deferred; native character bank inspection incomplete (world, character set or NpcParam unavailable)",
+        );
+    }
+    state.native_scan_incomplete_logged = defer_unload;
+
     let inactive = state
         .loaded_banks
         .keys()
@@ -749,21 +802,27 @@ fn unload_inactive_banks(
     }
 
     for bank_id in inactive {
-        let Some(tracked_bank) = state.loaded_banks.remove(&bank_id) else {
+        let Some(tracked_bank) = state.loaded_banks.get(&bank_id).copied() else {
             continue;
         };
 
-        if tracked_bank.ownership == BankOwnership::External {
+        if tracked_bank.ownership != BankOwnership::Loader {
+            state.loaded_banks.remove(&bank_id);
             append_log(
                 log_path,
                 &format!(
-                    "conditional released bank id={bank_id} loaded_bank_id=0x{:08X}; unload skipped ownership=external (bank pre-existed in Wwise)",
-                    tracked_bank.loaded_bank_id
+                    "conditional released bank id={bank_id} loaded_bank_id=0x{:08X}; unload skipped ownership={}",
+                    tracked_bank.loaded_bank_id,
+                    tracked_bank.ownership.as_str()
                 ),
             );
             continue;
         }
 
+        if !native_banks.complete {
+            continue;
+        }
+        state.loaded_banks.remove(&bank_id);
         let message = unsafe { unload_bank(api, tracked_bank.loaded_bank_id) };
         append_log(
             log_path,
@@ -773,6 +832,92 @@ fn unload_inactive_banks(
             ),
         );
     }
+}
+
+fn native_character_bank_ids(character_id: u32, primary: i16, additional: i16) -> [Option<u32>; 2] {
+    let primary = if primary < 0 {
+        character_id
+    } else {
+        primary as u32
+    };
+    [
+        (primary != 0).then_some(primary),
+        (additional > 0).then_some(additional as u32),
+    ]
+}
+
+fn detect_native_sound_banks(candidates: &HashSet<u32>) -> NativeBankSnapshot {
+    let mut snapshot = NativeBankSnapshot::default();
+    if candidates.is_empty() {
+        snapshot.complete = true;
+        return snapshot;
+    }
+    let (Ok(world), Ok(repo)) = (unsafe { WorldChrMan::instance() }, unsafe {
+        SoloParamRepository::instance()
+    }) else {
+        return snapshot;
+    };
+    snapshot.complete = true;
+    let mut sets_complete = true;
+    let mut seen_characters = HashSet::new();
+    let mut observe = |chr: &ChrIns| {
+        if !seen_characters.insert(chr as *const ChrIns as usize) {
+            return;
+        }
+        let Some(npc) = repo.get::<NpcParam>(chr.npc_param_id as u32) else {
+            snapshot.complete = false;
+            return;
+        };
+        for id in native_character_bank_ids(
+            chr.character_id,
+            npc.sound_bank_id(),
+            npc.sound_add_bank_id(),
+        )
+        .into_iter()
+        .flatten()
+        {
+            if candidates.contains(&id) {
+                snapshot.bank_ids.insert(id);
+            }
+        }
+    };
+    if world.player_chr_set.capacity > 65536 {
+        sets_complete = false;
+    } else if world.player_chr_set.capacity != 0 {
+        for player in world.player_chr_set.characters() {
+            observe(&player.chr_ins);
+        }
+    }
+    let mut seen_sets = HashSet::new();
+    for set in world
+        .chr_sets
+        .iter()
+        .flatten()
+        .chain(world.null_chr_set.iter())
+        .map(|set| &**set)
+        .chain([
+            &world.open_field_chr_set.base,
+            &world.summon_buddy_chr_set,
+            &world.debug_chr_set,
+            &world.ghost_chr_set,
+        ])
+    {
+        if !seen_sets.insert(set as *const _ as usize) {
+            continue;
+        }
+        // Reject implausible metadata rather than walking an unbounded native array.
+        if set.capacity > 65536 {
+            sets_complete = false;
+            continue;
+        }
+        if set.capacity != 0 {
+            for chr in set.characters() {
+                observe(chr);
+            }
+        }
+    }
+    snapshot.complete &= sets_complete;
+    snapshot
 }
 
 unsafe fn request_sound_bank(
@@ -907,6 +1052,234 @@ fn player_sp_atkcategory(
 mod tests {
     use super::*;
     use pelite::pe64::PeFile;
+
+    std::thread_local! {
+        static FAKE_BANK_LOADED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    unsafe extern "C" fn unused_register(
+        _: &CSTaskImp,
+        _: CSTaskGroupIndex,
+        _: &RecurringTask<FD4TaskData>,
+    ) {
+    }
+
+    unsafe extern "system" fn fake_load(_: *const c_void, _: u32, id: *mut u32) -> i32 {
+        unsafe { *id = 0x5f80e323 };
+        if FAKE_BANK_LOADED.replace(true) {
+            AK_BANK_ALREADY_LOADED
+        } else {
+            AK_SUCCESS
+        }
+    }
+
+    unsafe extern "system" fn fake_unload(_: u32, _: *const c_void) -> i32 {
+        FAKE_BANK_LOADED.set(false);
+        AK_SUCCESS
+    }
+
+    fn fake_api() -> RuntimeApi {
+        RuntimeApi {
+            register_task: unused_register,
+            register_task_rva: 0,
+            load_bank_memory_copy: fake_load,
+            load_bank_memory_copy_rva: 0,
+            unload_bank: fake_unload,
+            unload_bank_rva: 0,
+        }
+    }
+
+    #[test]
+    fn native_boss_claim_after_weapon_load_survives_weapon_switch() {
+        FAKE_BANK_LOADED.set(false);
+        let api = fake_api();
+        let mut loaded_bank_id = 0;
+        let first =
+            unsafe { (api.load_bank_memory_copy)(std::ptr::null(), 0, &mut loaded_bank_id) };
+        let mut state = ConditionalState::default();
+        state.loaded_banks.insert(
+            9495,
+            TrackedBank {
+                loaded_bank_id,
+                ownership: bank_ownership_for_load_result(first).unwrap(),
+            },
+        );
+        let native =
+            unsafe { (api.load_bank_memory_copy)(std::ptr::null(), 0, &mut loaded_bank_id) };
+        assert_eq!(native, AK_BANK_ALREADY_LOADED);
+        unload_inactive_banks(
+            &None,
+            &HashSet::new(),
+            &NativeBankSnapshot {
+                bank_ids: HashSet::from([9495]),
+                complete: true,
+            },
+            &mut state,
+            api,
+        );
+        assert!(
+            FAKE_BANK_LOADED.get(),
+            "switching the weapon silenced the native Boss bank"
+        );
+    }
+
+    fn loaded_fake_state(ownership: BankOwnership) -> ConditionalState {
+        FAKE_BANK_LOADED.set(true);
+        ConditionalState {
+            loaded_banks: HashMap::from([(
+                9495,
+                TrackedBank {
+                    loaded_bank_id: 0x5f80e323,
+                    ownership,
+                },
+            )]),
+            ..ConditionalState::default()
+        }
+    }
+
+    fn native_snapshot(ids: &[u32], complete: bool) -> NativeBankSnapshot {
+        NativeBankSnapshot {
+            bank_ids: ids.iter().copied().collect(),
+            complete,
+        }
+    }
+
+    #[test]
+    fn native_claim_is_remembered_before_weapon_switch_even_after_boss_leaves() {
+        let mut state = loaded_fake_state(BankOwnership::Loader);
+        unload_inactive_banks(
+            &None,
+            &HashSet::from([9495]),
+            &native_snapshot(&[9495], true),
+            &mut state,
+            fake_api(),
+        );
+        assert_eq!(
+            state.loaded_banks[&9495].ownership,
+            BankOwnership::NativeCharacter
+        );
+        unload_inactive_banks(
+            &None,
+            &HashSet::new(),
+            &native_snapshot(&[], true),
+            &mut state,
+            fake_api(),
+        );
+        assert!(FAKE_BANK_LOADED.get());
+        assert!(state.loaded_banks.is_empty());
+    }
+
+    #[test]
+    fn preexisting_native_bank_survives_switch_without_current_character_snapshot() {
+        FAKE_BANK_LOADED.set(true);
+        let mut id = 0;
+        let result = unsafe { fake_load(std::ptr::null(), 0, &mut id) };
+        let mut state = loaded_fake_state(bank_ownership_for_load_result(result).unwrap());
+        unload_inactive_banks(
+            &None,
+            &HashSet::new(),
+            &NativeBankSnapshot::default(),
+            &mut state,
+            fake_api(),
+        );
+        assert!(FAKE_BANK_LOADED.get());
+        assert!(state.loaded_banks.is_empty());
+    }
+
+    #[test]
+    fn inactive_weapon_only_bank_is_still_unloaded() {
+        let mut state = loaded_fake_state(BankOwnership::Loader);
+        unload_inactive_banks(
+            &None,
+            &HashSet::new(),
+            &native_snapshot(&[4205], true),
+            &mut state,
+            fake_api(),
+        );
+        assert!(!FAKE_BANK_LOADED.get());
+        assert!(state.loaded_banks.is_empty());
+    }
+
+    #[test]
+    fn active_weapon_or_sp_effect_bank_keeps_loader_ownership_without_native_claim() {
+        let mut state = loaded_fake_state(BankOwnership::Loader);
+        unload_inactive_banks(
+            &None,
+            &HashSet::from([9495]),
+            &native_snapshot(&[], true),
+            &mut state,
+            fake_api(),
+        );
+        assert!(FAKE_BANK_LOADED.get());
+        assert_eq!(state.loaded_banks[&9495].ownership, BankOwnership::Loader);
+    }
+
+    #[test]
+    fn incomplete_native_scan_defers_owned_unload_until_inspection_recovers() {
+        let mut state = loaded_fake_state(BankOwnership::Loader);
+        for _ in 0..2 {
+            unload_inactive_banks(
+                &None,
+                &HashSet::new(),
+                &NativeBankSnapshot::default(),
+                &mut state,
+                fake_api(),
+            );
+            assert!(FAKE_BANK_LOADED.get());
+            assert!(state.loaded_banks.contains_key(&9495));
+        }
+        unload_inactive_banks(
+            &None,
+            &HashSet::new(),
+            &native_snapshot(&[], true),
+            &mut state,
+            fake_api(),
+        );
+        assert!(!FAKE_BANK_LOADED.get());
+        assert!(state.loaded_banks.is_empty());
+    }
+
+    #[test]
+    fn partial_native_scan_still_remembers_known_native_claim() {
+        let mut state = loaded_fake_state(BankOwnership::Loader);
+        unload_inactive_banks(
+            &None,
+            &HashSet::from([9495]),
+            &native_snapshot(&[9495], false),
+            &mut state,
+            fake_api(),
+        );
+        unload_inactive_banks(
+            &None,
+            &HashSet::new(),
+            &native_snapshot(&[], true),
+            &mut state,
+            fake_api(),
+        );
+        assert!(FAKE_BANK_LOADED.get());
+        assert!(state.loaded_banks.is_empty());
+    }
+
+    #[test]
+    fn native_character_selection_includes_overrides_defaults_and_additional_banks() {
+        assert_eq!(
+            native_character_bank_ids(9495, 7800, 4205),
+            [Some(7800), Some(4205)]
+        );
+        assert_eq!(native_character_bank_ids(9495, -1, -1), [Some(9495), None]);
+        assert_eq!(native_character_bank_ids(9495, -2, 0), [Some(9495), None]);
+        assert_eq!(native_character_bank_ids(9495, 0, -1), [None, None]);
+        assert_eq!(native_character_bank_ids(0, -1, -1), [None, None]);
+        assert_eq!(
+            native_character_bank_ids(9495, -1, 9495),
+            [Some(9495), Some(9495)]
+        );
+    }
+
+    #[test]
+    fn no_owned_banks_need_no_native_world_access() {
+        assert!(detect_native_sound_banks(&HashSet::new()).complete);
+    }
 
     #[test]
     fn target_banks_are_union_of_all_player_conditions() {
