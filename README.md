@@ -1,5 +1,3 @@
-> 2026-10-21 compatibility build: ER App 1.17.2 / EXE 2.7.2.0. The candidate in `dist/er-1.17.2/` passed automated checks and is installed in the main `_GoldenAge` Mod. In-game acceptance is pending. Current spec, hashes, rollback and evidence: [1.17.2 build record](../../Topics/Gameplay/bug-er-1-17-2-dll-compat/build.md). Earlier version/publication notes below retain their original scope.
-
 # ERSoundBankLoader
 
 Elden Ring DLL for preloading character Sound Banks without spawning hidden 0-HP enemies.
